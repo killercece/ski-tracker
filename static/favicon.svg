@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect width="64" height="64" rx="14" fill="#0284c7"/>
+  <g fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Montagne -->
+    <path d="M12 50 L32 18 L52 50 Z" fill="white" fill-opacity="0.15"/>
+    <path d="M12 50 L32 18 L52 50" fill="none"/>
+    <path d="M22 50 L32 34 L42 50"/>
+    <!-- Skieur stylise -->
+    <circle cx="44" cy="14" r="3" fill="white" stroke="none"/>
+    <path d="M44 17 L44 28 M40 22 L48 22 M44 28 L39 38 M44 28 L49 38"/>
+    <!-- Batons -->
+    <path d="M40 22 L36 32" stroke-width="1.5"/>
+    <path d="M48 22 L52 32" stroke-width="1.5"/>
+  </g>
+</svg>

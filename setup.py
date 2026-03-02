@@ -1,0 +1,81 @@
+"""
+Script d'initialisation de la base de données ski-tracker.
+Crée les tables, index et dossiers nécessaires.
+"""
+
+import sqlite3
+import os
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+DATABASE_PATH = os.environ.get('DATABASE_PATH', 'data/ski-tracker.db')
+UPLOAD_FOLDER = os.environ.get('UPLOAD_FOLDER', 'data/uploads')
+
+
+def setup():
+    """Initialise la base de données et les dossiers nécessaires."""
+
+    # Création des dossiers
+    os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    logger.info("Dossiers créés : %s, %s", os.path.dirname(DATABASE_PATH), UPLOAD_FOLDER)
+
+    # Connexion et création des tables
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            date TEXT NOT NULL,
+            total_distance REAL DEFAULT 0,
+            total_elevation_gain REAL DEFAULT 0,
+            total_elevation_loss REAL DEFAULT 0,
+            max_speed REAL DEFAULT 0,
+            avg_speed REAL DEFAULT 0,
+            num_descents INTEGER DEFAULT 0,
+            duration_seconds INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS tracks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            segment_type TEXT NOT NULL CHECK(segment_type IN ('descent', 'lift', 'pause')),
+            start_time TEXT,
+            end_time TEXT,
+            distance REAL DEFAULT 0,
+            elevation_change REAL DEFAULT 0,
+            avg_speed REAL DEFAULT 0,
+            max_speed REAL DEFAULT 0,
+            duration_seconds INTEGER DEFAULT 0,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS track_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            track_id INTEGER NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            elevation REAL,
+            time TEXT,
+            speed REAL,
+            point_order INTEGER NOT NULL,
+            FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tracks_session ON tracks(session_id);
+        CREATE INDEX IF NOT EXISTS idx_points_track ON track_points(track_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_date ON sessions(date);
+    """)
+
+    conn.commit()
+    conn.close()
+    logger.info("Base de données initialisée : %s", DATABASE_PATH)
+
+
+if __name__ == '__main__':
+    setup()

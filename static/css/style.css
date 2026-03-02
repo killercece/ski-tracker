@@ -1,0 +1,130 @@
+/* Ski Tracker - Styles complementaires (Tailwind gere le reste) */
+
+/* Sidebar mobile toggle */
+#sidebar.open {
+    transform: translateX(0);
+}
+
+/* Carte Leaflet */
+.map-container {
+    height: 500px;
+    width: 100%;
+    z-index: 10;
+}
+
+@media (max-width: 640px) {
+    .map-container {
+        height: 350px;
+    }
+}
+
+/* Leaflet overrides pour le theme sombre */
+.dark .leaflet-control-zoom a,
+.dark .leaflet-control-layers {
+    background-color: #18181b;
+    color: #fafafa;
+    border-color: #27272a;
+}
+
+.dark .leaflet-control-zoom a:hover {
+    background-color: #27272a;
+}
+
+.dark .leaflet-control-layers-list {
+    background-color: #18181b;
+    color: #fafafa;
+}
+
+.dark .leaflet-popup-content-wrapper {
+    background-color: #18181b;
+    color: #fafafa;
+    border: 1px solid #27272a;
+}
+
+.dark .leaflet-popup-tip {
+    background-color: #18181b;
+}
+
+/* Drop zone animation */
+.drop-zone.dragover {
+    border-color: #0284c7;
+    background-color: rgba(2, 132, 199, 0.05);
+}
+
+.dark .drop-zone.dragover {
+    background-color: rgba(2, 132, 199, 0.1);
+}
+
+.drop-zone.dragover svg {
+    animation: bounce-gentle 0.6s ease-in-out infinite alternate;
+}
+
+@keyframes bounce-gentle {
+    from { transform: translateY(0); }
+    to   { transform: translateY(-6px); }
+}
+
+/* Toast animations */
+.toast-enter {
+    animation: toast-in 0.3s ease-out forwards;
+}
+
+.toast-exit {
+    animation: toast-out 0.3s ease-in forwards;
+}
+
+@keyframes toast-in {
+    from {
+        opacity: 0;
+        transform: translateY(10px) scale(0.95);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+@keyframes toast-out {
+    from {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+    to {
+        opacity: 0;
+        transform: translateY(10px) scale(0.95);
+    }
+}
+
+/* Table row hover */
+#descents-table tr {
+    cursor: pointer;
+    transition: background-color 0.15s;
+}
+
+#descents-table tr:hover {
+    background-color: rgba(2, 132, 199, 0.05);
+}
+
+.dark #descents-table tr:hover {
+    background-color: rgba(2, 132, 199, 0.1);
+}
+
+/* Session card hover */
+.session-card {
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.session-card:hover {
+    border-color: #0284c7;
+    box-shadow: 0 0 0 1px #0284c7;
+}
+
+/* Smooth page transitions */
+main {
+    animation: fade-in 0.2s ease-out;
+}
+
+@keyframes fade-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}

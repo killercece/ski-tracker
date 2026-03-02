@@ -1,0 +1,645 @@
+"""
+Ski Tracker — Application Flask pour le suivi de sessions de ski.
+Upload de fichiers GPX, détection automatique des descentes/remontées,
+statistiques et visualisation sur carte.
+"""
+
+__version__ = '1.0.0'
+
+import os
+import logging
+import sqlite3
+from datetime import datetime
+from math import radians, cos, sin, asin, sqrt
+from pathlib import Path
+
+import gpxpy
+from flask import Flask, g, request, jsonify, render_template
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'dev-secret-key-change-me')
+app.config['DATABASE_PATH'] = os.environ.get('DATABASE_PATH', 'data/ski-tracker.db')
+app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', 'data/uploads')
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_CONTENT_LENGTH', 52428800))
+
+# ---------------------------------------------------------------------------
+# Base de données
+# ---------------------------------------------------------------------------
+
+
+def get_db():
+    """Retourne une connexion SQLite stockée dans g."""
+    if 'db' not in g:
+        g.db = sqlite3.connect(app.config['DATABASE_PATH'])
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
+    return g.db
+
+
+def close_db(e=None):
+    """Ferme la connexion SQLite en fin de requête."""
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
+
+app.teardown_appcontext(close_db)
+
+
+@app.context_processor
+def inject_globals():
+    """Injecte les variables globales dans tous les templates."""
+    return {'version': __version__}
+
+# ---------------------------------------------------------------------------
+# Utilitaires GPS
+# ---------------------------------------------------------------------------
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    """Calcule la distance en mètres entre deux points GPS (formule de Haversine)."""
+    R = 6371000
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    return R * 2 * asin(sqrt(a))
+
+
+def parse_gpx(file_content):
+    """Parse un fichier GPX et retourne la liste des points."""
+    gpx = gpxpy.parse(file_content)
+    points = []
+    for track in gpx.tracks:
+        for segment in track.segments:
+            for point in segment.points:
+                points.append({
+                    'latitude': point.latitude,
+                    'longitude': point.longitude,
+                    'elevation': point.elevation,
+                    'time': point.time.isoformat() if point.time else None
+                })
+    return points
+
+
+def smooth_values(values, window=5):
+    """Lisse une liste de valeurs avec une moyenne mobile."""
+    smoothed = []
+    half = window // 2
+    for i in range(len(values)):
+        start = max(0, i - half)
+        end = min(len(values), i + half + 1)
+        smoothed.append(sum(values[start:end]) / (end - start))
+    return smoothed
+
+
+def compute_point_metrics(points):
+    """Calcule vitesse (km/h) et variation d'altitude entre chaque paire de points."""
+    speeds = [0.0]
+    elevation_deltas = [0.0]
+
+    for i in range(1, len(points)):
+        prev, curr = points[i - 1], points[i]
+        dist = haversine(prev['latitude'], prev['longitude'],
+                         curr['latitude'], curr['longitude'])
+
+        dt = 0.0
+        if prev['time'] and curr['time']:
+            t1 = datetime.fromisoformat(prev['time'])
+            t2 = datetime.fromisoformat(curr['time'])
+            dt = (t2 - t1).total_seconds()
+
+        speed = (dist / dt * 3.6) if dt > 0 else 0.0
+        elev_delta = (curr['elevation'] or 0) - (prev['elevation'] or 0)
+
+        speeds.append(speed)
+        elevation_deltas.append(elev_delta)
+
+    return speeds, elevation_deltas
+
+
+def classify_point(speed, elev_delta):
+    """Classifie un point individuel en phase."""
+    if speed < 2.0:
+        return 'pause'
+    if elev_delta < 0 and speed > 5.0:
+        return 'descent'
+    if elev_delta > 0 and speed < 15.0:
+        return 'lift'
+    # Zone ambiguë : privilégier descente si rapide
+    if speed > 15.0:
+        return 'descent'
+    return 'lift'
+
+
+def detect_segments(points):
+    """
+    Détecte les segments de type : descent, lift, pause.
+
+    Utilise un algorithme à fenêtre glissante :
+    1. Calcule vitesse et variation d'altitude entre chaque point
+    2. Lisse les données (moyenne mobile sur 5 points)
+    3. Détecte les changements de phase
+    4. Crée des segments avec stats
+
+    Retourne une liste de segments avec type, points, et statistiques.
+    """
+    if len(points) < 2:
+        return []
+
+    speeds, elevation_deltas = compute_point_metrics(points)
+
+    # Lissage
+    smoothed_speeds = smooth_values(speeds, window=5)
+    smoothed_elev = smooth_values(elevation_deltas, window=5)
+
+    # Classification par point
+    classifications = []
+    for i in range(len(points)):
+        classifications.append(classify_point(smoothed_speeds[i], smoothed_elev[i]))
+
+    # Construction des segments
+    segments = []
+    seg_start = 0
+    current_type = classifications[0]
+
+    for i in range(1, len(classifications)):
+        if classifications[i] != current_type:
+            segments.append(_build_segment(
+                points[seg_start:i + 1], current_type, speeds[seg_start:i + 1]
+            ))
+            seg_start = i
+            current_type = classifications[i]
+
+    # Dernier segment
+    segments.append(_build_segment(
+        points[seg_start:], current_type, speeds[seg_start:]
+    ))
+
+    # Filtrer les segments trop courts (< 3 points) et les fusionner
+    segments = _merge_short_segments(segments)
+
+    # Valider les segments selon les seuils d'altitude
+    segments = _validate_segments(segments)
+
+    return segments
+
+
+def _build_segment(seg_points, seg_type, seg_speeds):
+    """Construit un segment avec ses statistiques."""
+    total_dist = 0.0
+    for i in range(1, len(seg_points)):
+        total_dist += haversine(
+            seg_points[i - 1]['latitude'], seg_points[i - 1]['longitude'],
+            seg_points[i]['latitude'], seg_points[i]['longitude']
+        )
+
+    elev_start = seg_points[0].get('elevation') or 0
+    elev_end = seg_points[-1].get('elevation') or 0
+    elev_change = elev_end - elev_start
+
+    duration = 0
+    if seg_points[0]['time'] and seg_points[-1]['time']:
+        t1 = datetime.fromisoformat(seg_points[0]['time'])
+        t2 = datetime.fromisoformat(seg_points[-1]['time'])
+        duration = int((t2 - t1).total_seconds())
+
+    valid_speeds = [s for s in seg_speeds if s > 0]
+    avg_speed = sum(valid_speeds) / len(valid_speeds) if valid_speeds else 0.0
+    max_speed = max(seg_speeds) if seg_speeds else 0.0
+
+    return {
+        'type': seg_type,
+        'points': seg_points,
+        'distance': round(total_dist / 1000, 2),
+        'elevation_change': round(elev_change, 2),
+        'duration_seconds': duration,
+        'avg_speed': round(avg_speed, 2),
+        'max_speed': round(max_speed, 2),
+        'start_time': seg_points[0]['time'],
+        'end_time': seg_points[-1]['time'],
+    }
+
+
+def _merge_short_segments(segments, min_points=3):
+    """Fusionne les segments trop courts avec le segment précédent."""
+    if not segments:
+        return segments
+
+    merged = [segments[0]]
+    for seg in segments[1:]:
+        if len(seg['points']) < min_points:
+            # Fusionner avec le précédent
+            prev = merged[-1]
+            combined_points = prev['points'] + seg['points'][1:]
+            combined_speeds = []
+            for i in range(1, len(combined_points)):
+                p1, p2 = combined_points[i - 1], combined_points[i]
+                d = haversine(p1['latitude'], p1['longitude'],
+                              p2['latitude'], p2['longitude'])
+                dt = 0.0
+                if p1['time'] and p2['time']:
+                    dt = (datetime.fromisoformat(p2['time']) -
+                          datetime.fromisoformat(p1['time'])).total_seconds()
+                combined_speeds.append((d / dt * 3.6) if dt > 0 else 0.0)
+            combined_speeds.insert(0, 0.0)
+
+            merged[-1] = _build_segment(combined_points, prev['type'], combined_speeds)
+        else:
+            merged.append(seg)
+
+    return merged
+
+
+def _validate_segments(segments):
+    """Valide les segments selon les seuils d'altitude (50m)."""
+    for seg in segments:
+        elev = abs(seg['elevation_change'])
+        if seg['type'] == 'descent' and elev < 50:
+            seg['type'] = 'pause'
+        elif seg['type'] == 'lift' and elev < 50:
+            seg['type'] = 'pause'
+    return segments
+
+
+def compute_session_stats(segments):
+    """Calcule les statistiques globales d'une session à partir de ses segments."""
+    stats = {
+        'total_distance': 0.0,
+        'total_elevation_gain': 0.0,
+        'total_elevation_loss': 0.0,
+        'max_speed': 0.0,
+        'avg_speed': 0.0,
+        'num_descents': 0,
+        'duration_seconds': 0,
+    }
+
+    total_speed_weighted = 0.0
+    total_moving_time = 0
+
+    for seg in segments:
+        stats['total_distance'] += seg['distance']
+        stats['duration_seconds'] += seg['duration_seconds']
+
+        if seg['elevation_change'] > 0:
+            stats['total_elevation_gain'] += seg['elevation_change']
+        else:
+            stats['total_elevation_loss'] += abs(seg['elevation_change'])
+
+        if seg['max_speed'] > stats['max_speed']:
+            stats['max_speed'] = seg['max_speed']
+
+        if seg['type'] == 'descent':
+            stats['num_descents'] += 1
+
+        if seg['type'] != 'pause' and seg['duration_seconds'] > 0:
+            total_speed_weighted += seg['avg_speed'] * seg['duration_seconds']
+            total_moving_time += seg['duration_seconds']
+
+    if total_moving_time > 0:
+        stats['avg_speed'] = total_speed_weighted / total_moving_time
+
+    # Arrondir
+    for key in stats:
+        if isinstance(stats[key], float):
+            stats[key] = round(stats[key], 2)
+
+    return stats
+
+
+def save_session(db, name, date_str, stats, segments):
+    """Sauvegarde une session complète en BDD (session + tracks + points)."""
+    cursor = db.execute(
+        """INSERT INTO sessions
+           (name, date, total_distance, total_elevation_gain, total_elevation_loss,
+            max_speed, avg_speed, num_descents, duration_seconds)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (name, date_str,
+         stats['total_distance'], stats['total_elevation_gain'],
+         stats['total_elevation_loss'], stats['max_speed'],
+         stats['avg_speed'], stats['num_descents'],
+         stats['duration_seconds'])
+    )
+    session_id = cursor.lastrowid
+
+    for seg in segments:
+        track_cursor = db.execute(
+            """INSERT INTO tracks
+               (session_id, segment_type, start_time, end_time, distance,
+                elevation_change, avg_speed, max_speed, duration_seconds)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, seg['type'], seg['start_time'], seg['end_time'],
+             seg['distance'], seg['elevation_change'], seg['avg_speed'],
+             seg['max_speed'], seg['duration_seconds'])
+        )
+        track_id = track_cursor.lastrowid
+
+        # Insertion par batch pour la performance
+        point_data = []
+        for order, pt in enumerate(seg['points']):
+            point_data.append((
+                track_id, pt['latitude'], pt['longitude'],
+                pt['elevation'], pt['time'], None, order
+            ))
+
+        db.executemany(
+            """INSERT INTO track_points
+               (track_id, latitude, longitude, elevation, time, speed, point_order)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            point_data
+        )
+
+    db.commit()
+    return session_id
+
+# ---------------------------------------------------------------------------
+# Routes — Pages
+# ---------------------------------------------------------------------------
+
+
+@app.route('/')
+def index():
+    """Page d'accueil — dashboard avec stats globales."""
+    return render_template('index.html')
+
+
+@app.route('/session/<int:session_id>')
+def session_detail(session_id):
+    """Page de détail d'une session (carte + stats)."""
+    db = get_db()
+    session = db.execute(
+        "SELECT * FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if not session:
+        return render_template('index.html'), 404
+    return render_template('session.html', session=dict(session))
+
+# ---------------------------------------------------------------------------
+# Routes — API Health
+# ---------------------------------------------------------------------------
+
+
+@app.route('/api/health')
+def health():
+    """Health check pour PyDeploy."""
+    return jsonify({
+        'status': 'ok',
+        'version': __version__
+    })
+
+# ---------------------------------------------------------------------------
+# Routes — API Upload
+# ---------------------------------------------------------------------------
+
+
+@app.route('/api/upload', methods=['POST'])
+def upload_gpx():
+    """Upload et traitement d'un fichier GPX."""
+    if 'file' not in request.files:
+        return jsonify({'error': 'Aucun fichier fourni'}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'Nom de fichier vide'}), 400
+
+    # Validation de l'extension
+    if not file.filename.lower().endswith('.gpx'):
+        return jsonify({'error': 'Seuls les fichiers .gpx sont acceptés'}), 400
+
+    try:
+        # Lire le contenu
+        file_content = file.read().decode('utf-8')
+
+        # Sauvegarder le fichier original
+        upload_dir = app.config['UPLOAD_FOLDER']
+        os.makedirs(upload_dir, exist_ok=True)
+        safe_filename = Path(file.filename).name
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        saved_name = f"{timestamp}_{safe_filename}"
+        filepath = os.path.join(upload_dir, saved_name)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(file_content)
+        logger.info("Fichier GPX sauvegardé : %s", filepath)
+
+        # Parser le GPX
+        points = parse_gpx(file_content)
+        if not points:
+            return jsonify({'error': 'Aucun point GPS trouvé dans le fichier'}), 400
+
+        # Nom de session dérivé du nom de fichier
+        session_name = Path(file.filename).stem.replace('_', ' ').replace('-', ' ')
+
+        # Date de session extraite du premier point
+        session_date = datetime.now().strftime('%Y-%m-%d')
+        if points[0]['time']:
+            try:
+                session_date = datetime.fromisoformat(points[0]['time']).strftime('%Y-%m-%d')
+            except (ValueError, TypeError):
+                pass
+
+        # Détection des segments
+        segments = detect_segments(points)
+
+        # Calcul des stats
+        stats = compute_session_stats(segments)
+
+        # Sauvegarde en BDD
+        db = get_db()
+        session_id = save_session(db, session_name, session_date, stats, segments)
+        logger.info("Session créée : id=%d, name=%s, %d segments",
+                     session_id, session_name, len(segments))
+
+        return jsonify({
+            'id': session_id,
+            'name': session_name,
+            'date': session_date,
+            'stats': stats,
+            'num_segments': len(segments)
+        }), 201
+
+    except gpxpy.gpx.GPXXMLSyntaxException:
+        logger.warning("Fichier GPX invalide uploadé : %s", file.filename)
+        return jsonify({'error': 'Fichier GPX invalide ou mal formé'}), 400
+    except Exception as e:
+        logger.exception("Erreur lors du traitement du fichier GPX")
+        return jsonify({'error': f'Erreur de traitement : {str(e)}'}), 500
+
+# ---------------------------------------------------------------------------
+# Routes — API Données
+# ---------------------------------------------------------------------------
+
+
+@app.route('/api/sessions')
+def api_sessions():
+    """Liste toutes les sessions avec leurs stats résumées."""
+    try:
+        db = get_db()
+        sessions = db.execute(
+            """SELECT id, name, date, total_distance, total_elevation_gain,
+                      total_elevation_loss, max_speed, avg_speed, num_descents,
+                      duration_seconds, created_at
+               FROM sessions ORDER BY date DESC"""
+        ).fetchall()
+
+        return jsonify([dict(s) for s in sessions])
+
+    except Exception as e:
+        logger.exception("Erreur lors de la récupération des sessions")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sessions/<int:session_id>')
+def api_session_detail(session_id):
+    """Détail d'une session avec ses stats et segments."""
+    try:
+        db = get_db()
+        session = db.execute(
+            "SELECT * FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+
+        if not session:
+            return jsonify({'error': 'Session non trouvée'}), 404
+
+        tracks = db.execute(
+            """SELECT id, segment_type, start_time, end_time, distance,
+                      elevation_change, avg_speed, max_speed, duration_seconds
+               FROM tracks WHERE session_id = ? ORDER BY start_time""",
+            (session_id,)
+        ).fetchall()
+
+        return jsonify({
+            'session': dict(session),
+            'tracks': [dict(t) for t in tracks]
+        })
+
+    except Exception as e:
+        logger.exception("Erreur lors de la récupération de la session %d", session_id)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sessions/<int:session_id>', methods=['DELETE'])
+def api_delete_session(session_id):
+    """Supprime une session et toutes ses données associées."""
+    try:
+        db = get_db()
+        session = db.execute(
+            "SELECT id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+
+        if not session:
+            return jsonify({'error': 'Session non trouvée'}), 404
+
+        db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        db.commit()
+        logger.info("Session supprimée : id=%d", session_id)
+
+        return jsonify({'message': 'Session supprimée'}), 200
+
+    except Exception as e:
+        logger.exception("Erreur lors de la suppression de la session %d", session_id)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sessions/<int:session_id>/tracks')
+def api_session_tracks(session_id):
+    """Retourne les traces GPS d'une session pour affichage Leaflet."""
+    try:
+        db = get_db()
+        session = db.execute(
+            "SELECT id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+
+        if not session:
+            return jsonify({'error': 'Session non trouvée'}), 404
+
+        tracks = db.execute(
+            """SELECT id, segment_type, start_time, end_time, distance,
+                      elevation_change, avg_speed, max_speed, duration_seconds
+               FROM tracks WHERE session_id = ? ORDER BY start_time""",
+            (session_id,)
+        ).fetchall()
+
+        result = []
+        for track in tracks:
+            points = db.execute(
+                """SELECT latitude, longitude, elevation, time, speed
+                   FROM track_points WHERE track_id = ?
+                   ORDER BY point_order""",
+                (track['id'],)
+            ).fetchall()
+
+            result.append({
+                'track': dict(track),
+                'points': [dict(p) for p in points]
+            })
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.exception("Erreur lors de la récupération des tracks de la session %d",
+                         session_id)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/stats')
+def api_global_stats():
+    """Statistiques globales agrégées sur toutes les sessions."""
+    try:
+        db = get_db()
+        stats = db.execute(
+            """SELECT
+                COUNT(*) as total_sessions,
+                COALESCE(SUM(total_distance), 0) as total_distance,
+                COALESCE(SUM(total_elevation_gain), 0) as total_elevation_gain,
+                COALESCE(SUM(total_elevation_loss), 0) as total_elevation_loss,
+                COALESCE(MAX(max_speed), 0) as max_speed,
+                COALESCE(SUM(num_descents), 0) as total_descents,
+                COALESCE(SUM(duration_seconds), 0) as total_duration
+               FROM sessions"""
+        ).fetchone()
+
+        result = dict(stats)
+
+        # Vitesse moyenne pondérée
+        avg_row = db.execute(
+            """SELECT
+                CASE WHEN SUM(duration_seconds) > 0
+                     THEN SUM(avg_speed * duration_seconds) / SUM(duration_seconds)
+                     ELSE 0 END as avg_speed
+               FROM sessions
+               WHERE duration_seconds > 0"""
+        ).fetchone()
+        result['avg_speed'] = round(avg_row['avg_speed'], 2) if avg_row else 0
+
+        # Arrondir les flottants
+        for key in ['total_distance', 'total_elevation_gain', 'total_elevation_loss',
+                     'max_speed']:
+            result[key] = round(result[key], 2)
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.exception("Erreur lors du calcul des stats globales")
+        return jsonify({'error': str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Lancement
+# ---------------------------------------------------------------------------
+
+if __name__ == '__main__':
+    debug = os.environ.get('DEBUG', 'False').lower() in ('true', '1')
+    app.run(debug=debug, host='0.0.0.0', port=5000)
