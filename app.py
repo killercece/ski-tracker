@@ -145,19 +145,15 @@ def init_db():
         conn.execute("ALTER TABLE tracks ADD COLUMN piste_difficulty TEXT")
         conn.execute("ALTER TABLE tracks ADD COLUMN match_confidence REAL")
         logger.info("Migration : colonnes piste matching ajoutées à tracks")
-    # v1.4.2 : purger cache OSM et matchs pour re-fetch avec relations + name:fr
-    osm_version = conn.execute(
-        "SELECT fetched_at FROM osm_fetch_zones ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    if osm_version and osm_version[0] < '2026-03-05':
+    # Migrations one-shot (gardées via table schema_version)
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version TEXT PRIMARY KEY)")
+    applied = {r[0] for r in conn.execute("SELECT version FROM schema_version").fetchall()}
+    if '1.4.3' not in applied:
         conn.execute("DELETE FROM osm_pistes")
         conn.execute("DELETE FROM osm_fetch_zones")
         conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
-        logger.info("Migration v1.4.2 : cache OSM purgé pour re-fetch avec relations")
-    # v1.4.3 : purger matchs pour rematch avec correction difficultés référence
-    if osm_version and osm_version[0] < '2026-03-06':
-        conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
-        logger.info("Migration v1.4.3 : matchs purgés pour rematch avec correction difficultés")
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.3')")
+        logger.info("Migration v1.4.3 : cache et matchs purgés (one-shot)")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
@@ -992,10 +988,17 @@ def _build_reference_lookup():
 
 
 def _lookup_reference(norm, lookup):
-    """Cherche un nom normalisé dans le lookup (exact match après normalisation)."""
+    """Cherche un nom normalisé dans le lookup avec fallback substring."""
     if not norm:
         return None
-    return lookup.get(norm)
+    # Match exact
+    if norm in lookup:
+        return lookup[norm]
+    # Match substring : le nom OSM contient le nom ref ou vice versa
+    for key, ref in lookup.items():
+        if len(key) >= 4 and len(norm) >= 4 and (key in norm or norm in key):
+            return ref
+    return None
 
 
 def _correct_from_reference(session_id):
