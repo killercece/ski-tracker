@@ -4,7 +4,7 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.3.0'
+__version__ = '1.4.0'
 
 import os
 import logging
@@ -14,6 +14,9 @@ from datetime import datetime
 from functools import wraps
 from math import radians, cos, sin, asin, sqrt
 from pathlib import Path
+
+import json
+import requests
 
 import gpxpy
 from flask import Flask, g, request, jsonify, render_template, session, redirect, url_for
@@ -109,6 +112,22 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_tracks_session ON tracks(session_id);
         CREATE INDEX IF NOT EXISTS idx_points_track ON track_points(track_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_date ON sessions(date);
+
+        CREATE TABLE IF NOT EXISTS osm_pistes (
+            osm_id INTEGER PRIMARY KEY,
+            name TEXT,
+            difficulty TEXT,
+            geometry TEXT,
+            bbox_min_lat REAL, bbox_max_lat REAL,
+            bbox_min_lon REAL, bbox_max_lon REAL,
+            fetched_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS osm_fetch_zones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            min_lat REAL, max_lat REAL,
+            min_lon REAL, max_lon REAL,
+            fetched_at TEXT
+        );
     """)
     # Migration : ajouter user_id si manquant
     cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
@@ -116,6 +135,14 @@ def init_db():
         conn.execute("ALTER TABLE sessions ADD COLUMN user_id INTEGER REFERENCES users(id)")
         logger.info("Migration : colonne user_id ajoutée")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+    # Migration : colonnes piste matching sur tracks
+    track_cols = [r[1] for r in conn.execute("PRAGMA table_info(tracks)").fetchall()]
+    if 'piste_osm_id' not in track_cols:
+        conn.execute("ALTER TABLE tracks ADD COLUMN piste_osm_id INTEGER")
+        conn.execute("ALTER TABLE tracks ADD COLUMN piste_name TEXT")
+        conn.execute("ALTER TABLE tracks ADD COLUMN piste_difficulty TEXT")
+        conn.execute("ALTER TABLE tracks ADD COLUMN match_confidence REAL")
+        logger.info("Migration : colonnes piste matching ajoutées à tracks")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
@@ -529,6 +556,243 @@ def compute_session_stats(segments):
 
 
 # ---------------------------------------------------------------------------
+# Matching descentes ↔ pistes OSM
+# ---------------------------------------------------------------------------
+
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+PISTE_CACHE_TTL_DAYS = 30
+MATCH_DISTANCE_THRESHOLD = 80  # mètres
+MATCH_MIN_SCORE = 0.50  # 50% des points doivent matcher
+
+
+def fetch_osm_pistes(min_lat, max_lat, min_lon, max_lon):
+    """Récupère les pistes de ski depuis Overpass API et les cache en BDD."""
+    query = f"""
+    [out:json][timeout:30];
+    (
+      way["piste:type"="downhill"]({min_lat},{min_lon},{max_lat},{max_lon});
+    );
+    out body;
+    >;
+    out skel qt;
+    """
+    try:
+        resp = requests.post(OVERPASS_URL, data={'data': query}, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.error("Erreur Overpass API : %s", e)
+        return 0
+
+    # Indexer les nodes
+    nodes = {}
+    for el in data.get('elements', []):
+        if el['type'] == 'node':
+            nodes[el['id']] = (el['lat'], el['lon'])
+
+    # Extraire les pistes (ways)
+    db = get_db()
+    count = 0
+    for el in data.get('elements', []):
+        if el['type'] != 'way':
+            continue
+        tags = el.get('tags', {})
+        if tags.get('piste:type') != 'downhill':
+            continue
+
+        osm_id = el['id']
+        name = tags.get('name') or tags.get('piste:name') or ''
+        difficulty = tags.get('piste:difficulty', 'unknown')
+
+        # Construire la géométrie
+        geometry = []
+        for nd_id in el.get('nodes', []):
+            if nd_id in nodes:
+                geometry.append(list(nodes[nd_id]))
+
+        if len(geometry) < 2:
+            continue
+
+        lats = [p[0] for p in geometry]
+        lons = [p[1] for p in geometry]
+
+        db.execute("""
+            INSERT OR REPLACE INTO osm_pistes
+            (osm_id, name, difficulty, geometry, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        """, (osm_id, name, difficulty, json.dumps(geometry),
+              min(lats), max(lats), min(lons), max(lons)))
+        count += 1
+
+    # Enregistrer la zone fetchée
+    db.execute("""
+        INSERT INTO osm_fetch_zones (min_lat, max_lat, min_lon, max_lon, fetched_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+    """, (min_lat, max_lat, min_lon, max_lon))
+    db.commit()
+    logger.info("Overpass : %d pistes récupérées pour bbox [%.4f,%.4f,%.4f,%.4f]",
+                count, min_lat, min_lon, max_lat, max_lon)
+    return count
+
+
+def ensure_pistes_cached(session_id):
+    """Vérifie que les pistes OSM sont en cache pour la zone de la session."""
+    db = get_db()
+
+    # Calculer la bounding box des points de la session
+    bbox = db.execute("""
+        SELECT MIN(tp.latitude) as min_lat, MAX(tp.latitude) as max_lat,
+               MIN(tp.longitude) as min_lon, MAX(tp.longitude) as max_lon
+        FROM track_points tp
+        JOIN tracks t ON tp.track_id = t.id
+        WHERE t.session_id = ?
+    """, (session_id,)).fetchone()
+
+    if not bbox or bbox['min_lat'] is None:
+        return
+
+    # Ajouter une marge de 0.01° (~1km)
+    margin = 0.01
+    min_lat = bbox['min_lat'] - margin
+    max_lat = bbox['max_lat'] + margin
+    min_lon = bbox['min_lon'] - margin
+    max_lon = bbox['max_lon'] + margin
+
+    # Vérifier si on a déjà fetché cette zone récemment
+    existing = db.execute("""
+        SELECT id FROM osm_fetch_zones
+        WHERE min_lat <= ? AND max_lat >= ? AND min_lon <= ? AND max_lon >= ?
+        AND fetched_at > datetime('now', ?)
+    """, (min_lat, max_lat, min_lon, max_lon, f'-{PISTE_CACHE_TTL_DAYS} days')).fetchone()
+
+    if existing:
+        return
+
+    fetch_osm_pistes(min_lat, max_lat, min_lon, max_lon)
+
+
+def point_to_segment_distance(lat, lon, lat1, lon1, lat2, lon2):
+    """Distance minimale d'un point à un segment de droite (en mètres, approx Haversine)."""
+    # Vecteurs en coordonnées plates (approximation locale)
+    cos_lat = cos(radians(lat))
+    dx = (lon2 - lon1) * cos_lat
+    dy = lat2 - lat1
+    px = (lon - lon1) * cos_lat
+    py = lat - lat1
+
+    seg_len_sq = dx * dx + dy * dy
+    if seg_len_sq < 1e-12:
+        return haversine(lat, lon, lat1, lon1)
+
+    t = max(0, min(1, (px * dx + py * dy) / seg_len_sq))
+    proj_lon = lon1 + t * (lon2 - lon1)
+    proj_lat = lat1 + t * (lat2 - lat1)
+
+    return haversine(lat, lon, proj_lat, proj_lon)
+
+
+def point_to_polyline_distance(lat, lon, polyline):
+    """Distance minimale d'un point à une polyline (liste de [lat, lon])."""
+    min_dist = float('inf')
+    for i in range(len(polyline) - 1):
+        d = point_to_segment_distance(
+            lat, lon,
+            polyline[i][0], polyline[i][1],
+            polyline[i + 1][0], polyline[i + 1][1]
+        )
+        if d < min_dist:
+            min_dist = d
+    return min_dist
+
+
+def match_track_to_piste(track_id):
+    """Matche un track de descente à la piste OSM la plus proche."""
+    db = get_db()
+
+    # Récupérer les points du track (échantillonner 1 sur 3)
+    points = db.execute("""
+        SELECT latitude, longitude FROM track_points
+        WHERE track_id = ? ORDER BY point_order
+    """, (track_id,)).fetchall()
+
+    if len(points) < 3:
+        return
+
+    sampled = points[::3]
+    if not sampled:
+        return
+
+    # Bounding box du track pour filtrer les pistes candidates
+    lats = [p['latitude'] for p in points]
+    lons = [p['longitude'] for p in points]
+    margin = 0.005  # ~500m
+    track_min_lat = min(lats) - margin
+    track_max_lat = max(lats) + margin
+    track_min_lon = min(lons) - margin
+    track_max_lon = max(lons) + margin
+
+    # Pistes candidates par intersection de bbox
+    pistes = db.execute("""
+        SELECT osm_id, name, difficulty, geometry
+        FROM osm_pistes
+        WHERE bbox_max_lat >= ? AND bbox_min_lat <= ?
+        AND bbox_max_lon >= ? AND bbox_min_lon <= ?
+    """, (track_min_lat, track_max_lat, track_min_lon, track_max_lon)).fetchall()
+
+    if not pistes:
+        return
+
+    best_piste = None
+    best_score = 0
+
+    for piste in pistes:
+        polyline = json.loads(piste['geometry'])
+        if len(polyline) < 2:
+            continue
+
+        close_count = 0
+        for pt in sampled:
+            dist = point_to_polyline_distance(pt['latitude'], pt['longitude'], polyline)
+            if dist <= MATCH_DISTANCE_THRESHOLD:
+                close_count += 1
+
+        score = close_count / len(sampled)
+        if score > best_score:
+            best_score = score
+            best_piste = piste
+
+    if best_piste and best_score >= MATCH_MIN_SCORE:
+        db.execute("""
+            UPDATE tracks SET piste_osm_id = ?, piste_name = ?, piste_difficulty = ?, match_confidence = ?
+            WHERE id = ?
+        """, (best_piste['osm_id'], best_piste['name'], best_piste['difficulty'],
+              round(best_score, 2), track_id))
+    else:
+        # Pas de match suffisant
+        db.execute("""
+            UPDATE tracks SET piste_osm_id = NULL, piste_name = NULL, piste_difficulty = NULL, match_confidence = NULL
+            WHERE id = ?
+        """, (track_id,))
+
+
+def match_session_pistes(session_id):
+    """Matche toutes les descentes d'une session aux pistes OSM."""
+    ensure_pistes_cached(session_id)
+
+    db = get_db()
+    descents = db.execute("""
+        SELECT id FROM tracks
+        WHERE session_id = ? AND segment_type = 'descent'
+    """, (session_id,)).fetchall()
+
+    for descent in descents:
+        match_track_to_piste(descent['id'])
+
+    db.commit()
+    logger.info("Matching pistes terminé pour session %d : %d descentes", session_id, len(descents))
+
+
+# ---------------------------------------------------------------------------
 # Routes — Pages
 # ---------------------------------------------------------------------------
 
@@ -846,7 +1110,8 @@ def api_session_tracks(session_id):
 
         tracks = db.execute(
             """SELECT id, segment_type, start_time, end_time, distance,
-                      elevation_change, avg_speed, max_speed, duration_seconds
+                      elevation_change, avg_speed, max_speed, duration_seconds,
+                      piste_osm_id, piste_name, piste_difficulty, match_confidence
                FROM tracks WHERE session_id = ? ORDER BY start_time""",
             (session_id,)
         ).fetchall()
@@ -865,11 +1130,117 @@ def api_session_tracks(session_id):
                 'points': [dict(p) for p in points]
             })
 
+        # Trigger matching si des descentes n'ont pas de match
+        has_unmatched = any(
+            t['track']['segment_type'] == 'descent' and t['track'].get('piste_osm_id') is None
+            for t in result
+        )
+        if has_unmatched:
+            try:
+                match_session_pistes(session_id)
+                # Re-fetch les tracks après matching
+                tracks = db.execute(
+                    """SELECT id, segment_type, start_time, end_time, distance,
+                              elevation_change, avg_speed, max_speed, duration_seconds,
+                              piste_osm_id, piste_name, piste_difficulty, match_confidence
+                       FROM tracks WHERE session_id = ? ORDER BY start_time""",
+                    (session_id,)
+                ).fetchall()
+                result = []
+                for track in tracks:
+                    points = db.execute(
+                        """SELECT latitude, longitude, elevation, time, speed
+                           FROM track_points WHERE track_id = ?
+                           ORDER BY point_order""",
+                        (track['id'],)
+                    ).fetchall()
+                    result.append({
+                        'track': dict(track),
+                        'points': [dict(p) for p in points]
+                    })
+            except Exception as e:
+                logger.warning("Erreur matching pistes : %s", e)
+
         return jsonify(result)
 
     except Exception as e:
         logger.exception("Erreur lors de la récupération des tracks de la session %d",
                          session_id)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sessions/<int:session_id>/pistes')
+@login_required
+def api_session_pistes(session_id):
+    """Retourne les pistes OSM dans la zone de la session."""
+    try:
+        db = get_db()
+        sess = db.execute(
+            "SELECT id FROM sessions WHERE id = ? AND user_id = ?", (session_id, session['user_id'])
+        ).fetchone()
+        if not sess:
+            return jsonify({'error': 'Session non trouvée'}), 404
+
+        ensure_pistes_cached(session_id)
+
+        # Bounding box de la session
+        bbox = db.execute("""
+            SELECT MIN(tp.latitude) as min_lat, MAX(tp.latitude) as max_lat,
+                   MIN(tp.longitude) as min_lon, MAX(tp.longitude) as max_lon
+            FROM track_points tp
+            JOIN tracks t ON tp.track_id = t.id
+            WHERE t.session_id = ?
+        """, (session_id,)).fetchone()
+
+        if not bbox or bbox['min_lat'] is None:
+            return jsonify([])
+
+        margin = 0.01
+        pistes = db.execute("""
+            SELECT osm_id, name, difficulty, geometry
+            FROM osm_pistes
+            WHERE bbox_max_lat >= ? AND bbox_min_lat <= ?
+            AND bbox_max_lon >= ? AND bbox_min_lon <= ?
+        """, (bbox['min_lat'] - margin, bbox['max_lat'] + margin,
+              bbox['min_lon'] - margin, bbox['max_lon'] + margin)).fetchall()
+
+        return jsonify([{
+            'osm_id': p['osm_id'],
+            'name': p['name'],
+            'difficulty': p['difficulty'],
+            'geometry': json.loads(p['geometry'])
+        } for p in pistes])
+
+    except Exception as e:
+        logger.exception("Erreur récupération pistes session %d", session_id)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sessions/<int:session_id>/rematch', methods=['POST'])
+@login_required
+def api_rematch_pistes(session_id):
+    """Force le re-matching des descentes aux pistes OSM."""
+    try:
+        db = get_db()
+        sess = db.execute(
+            "SELECT id FROM sessions WHERE id = ? AND user_id = ?", (session_id, session['user_id'])
+        ).fetchone()
+        if not sess:
+            return jsonify({'error': 'Session non trouvée'}), 404
+
+        # Reset les matchs existants
+        db.execute("""
+            UPDATE tracks SET piste_osm_id = NULL, piste_name = NULL,
+                   piste_difficulty = NULL, match_confidence = NULL
+            WHERE session_id = ? AND segment_type = 'descent'
+        """, (session_id,))
+        db.commit()
+
+        match_session_pistes(session_id)
+        return jsonify({'message': 'Re-matching terminé'})
+
+    except Exception as e:
+        logger.exception("Erreur rematch session %d", session_id)
         return jsonify({'error': str(e)}), 500
 
 

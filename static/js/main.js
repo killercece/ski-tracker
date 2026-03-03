@@ -75,6 +75,39 @@ function setText(id, value) {
     if (el) el.textContent = value;
 }
 
+function pisteColor(difficulty) {
+    var colors = {
+        'novice': '#22c55e', 'easy': '#22c55e',
+        'intermediate': '#3b82f6',
+        'advanced': '#ef4444',
+        'expert': '#18181b',
+        'freeride': '#f97316'
+    };
+    return colors[difficulty] || '#9ca3af';
+}
+
+function pisteBadgeClass(difficulty) {
+    var classes = {
+        'novice': 'green', 'easy': 'green',
+        'intermediate': 'blue',
+        'advanced': 'red',
+        'expert': 'black',
+        'freeride': 'orange'
+    };
+    return classes[difficulty] || '';
+}
+
+function pisteDifficultyLabel(difficulty) {
+    var labels = {
+        'novice': 'Verte', 'easy': 'Verte',
+        'intermediate': 'Bleue',
+        'advanced': 'Rouge',
+        'expert': 'Noire',
+        'freeride': 'Freeride'
+    };
+    return labels[difficulty] || difficulty || '';
+}
+
 // ---------------------------------------------------------------------------
 // Theme sombre / clair
 // ---------------------------------------------------------------------------
@@ -276,7 +309,7 @@ async function loadDayData(dateStr) {
             flat.points = item.points;
             return flat;
         });
-        renderDayMap(flatTracks);
+        renderDayMap(flatTracks, sess.id);
         renderDayDescentsTable(flatTracks);
     } catch (e) {}
 }
@@ -285,7 +318,7 @@ async function loadDayData(dateStr) {
 // Vue jour : Carte Leaflet
 // ---------------------------------------------------------------------------
 
-function renderDayMap(tracks) {
+function renderDayMap(tracks, sessionId) {
     var mapEl = document.getElementById('day-map');
     if (!mapEl || !tracks || tracks.length === 0) return;
 
@@ -299,13 +332,15 @@ function renderDayMap(tracks) {
     }).addTo(dayMap);
 
     var allBounds = [];
+    var pistesLayer = L.layerGroup();
     var overlays = {
+        'Pistes OSM': pistesLayer,
         'Descentes': L.layerGroup(),
         'Remontees': L.layerGroup(),
         'Pauses': L.layerGroup()
     };
 
-    var colors = { descent: '#ef4444', lift: '#3b82f6', pause: '#9ca3af' };
+    var defaultColors = { descent: '#ef4444', lift: '#3b82f6', pause: '#9ca3af' };
     var labels = { descent: 'Descente', lift: 'Remontee', pause: 'Pause' };
     var layerNames = { descent: 'Descentes', lift: 'Remontees', pause: 'Pauses' };
 
@@ -319,20 +354,39 @@ function renderDayMap(tracks) {
 
         var latlngs = track.points.map(function(p) { return [p.latitude, p.longitude]; });
 
+        // Couleur selon la difficulte de la piste matchee
+        var color = defaultColors[track.segment_type] || '#9ca3af';
+        var opacity = 0.85;
+        if (track.segment_type === 'descent') {
+            if (track.piste_difficulty) {
+                color = pisteColor(track.piste_difficulty);
+                if (track.piste_difficulty === 'expert') {
+                    color = '#18181b';
+                }
+            } else {
+                color = '#9ca3af';
+                opacity = 0.5;
+            }
+        }
+
         var polyline = L.polyline(latlngs, {
-            color: colors[track.segment_type] || '#9ca3af',
-            weight: 4, opacity: 0.85
+            color: color, weight: 4, opacity: opacity
         });
 
         var popupContent = '<div style="font-family: Inter, sans-serif; font-size: 13px; line-height: 1.5;">' +
             '<strong>' + (labels[track.segment_type] || track.segment_type) + '</strong>';
         if (track.segment_type === 'descent') popupContent += ' #' + track.descent_number;
+        if (track.piste_name) popupContent += '<br>Piste : <strong>' + track.piste_name + '</strong>';
+        if (track.piste_difficulty) popupContent += ' (' + pisteDifficultyLabel(track.piste_difficulty) + ')';
         popupContent += '<br>Distance : ' + fmt1(track.distance) + ' km<br>' +
             'Denivele : ' + fmt0(Math.abs(track.elevation_change)) + ' m<br>' +
             'Duree : ' + formatDuration(track.duration_seconds) + '<br>' +
             'Vit. moy : ' + fmt1(track.avg_speed) + ' km/h';
         if (track.segment_type === 'descent') {
             popupContent += '<br>Vit. max : ' + fmt1(track.max_speed) + ' km/h';
+        }
+        if (track.match_confidence) {
+            popupContent += '<br><span style="color:#888;">Confiance : ' + Math.round(track.match_confidence * 100) + '%</span>';
         }
         popupContent += '</div>';
         polyline.bindPopup(popupContent);
@@ -345,7 +399,10 @@ function renderDayMap(tracks) {
         latlngs.forEach(function(ll) { allBounds.push(ll); });
     });
 
-    Object.keys(overlays).forEach(function(name) { overlays[name].addTo(dayMap); });
+    Object.keys(overlays).forEach(function(name) {
+        if (name !== 'Pistes OSM') overlays[name].addTo(dayMap);
+    });
+    pistesLayer.addTo(dayMap);
 
     if (allBounds.length > 0) {
         var startIcon = L.divIcon({
@@ -364,6 +421,44 @@ function renderDayMap(tracks) {
     }
 
     L.control.layers(null, overlays, { collapsed: false }).addTo(dayMap);
+
+    // Charger les pistes OSM en arriere-plan
+    if (sessionId) {
+        loadPistesLayer(sessionId, pistesLayer);
+    }
+}
+
+async function loadPistesLayer(sessionId, pistesLayer) {
+    try {
+        var pistes = await api('/api/sessions/' + sessionId + '/pistes');
+        if (!pistes || pistes.length === 0) return;
+
+        pistes.forEach(function(piste) {
+            if (!piste.geometry || piste.geometry.length < 2) return;
+
+            var latlngs = piste.geometry.map(function(p) { return [p[0], p[1]]; });
+            var color = pisteColor(piste.difficulty);
+
+            var polyline = L.polyline(latlngs, {
+                color: color,
+                weight: 6,
+                opacity: 0.25,
+                dashArray: '8 6'
+            });
+
+            var name = piste.name || 'Sans nom';
+            polyline.bindPopup(
+                '<div style="font-family: Inter, sans-serif; font-size: 13px;">' +
+                '<strong>' + name + '</strong><br>' +
+                'Difficulte : ' + pisteDifficultyLabel(piste.difficulty) +
+                '</div>'
+            );
+
+            polyline.addTo(pistesLayer);
+        });
+    } catch (e) {
+        // Silencieux si les pistes ne chargent pas
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -386,8 +481,18 @@ function renderDayDescentsTable(tracks) {
     if (emptyEl) emptyEl.classList.add('hidden');
 
     tbody.innerHTML = descents.map(function(d, i) {
-        return '<tr onclick="zoomToDayTrack(' + d.id + ')" class="cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-800/50">' +
+        var rowClass = d.piste_name ? '' : ' class="unmatched-row"';
+        var pisteBadge = '';
+        if (d.piste_name) {
+            var badgeClass = pisteBadgeClass(d.piste_difficulty);
+            pisteBadge = '<span class="piste-badge ' + badgeClass + '"><span class="dot"></span>' + d.piste_name + '</span>';
+        } else {
+            pisteBadge = '<span class="text-zinc-400 dark:text-zinc-600 text-xs">&mdash;</span>';
+        }
+
+        return '<tr onclick="zoomToDayTrack(' + d.id + ')"' + rowClass + '>' +
             '<td class="px-4 py-3 font-medium">' + (i + 1) + '</td>' +
+            '<td class="px-4 py-3">' + pisteBadge + '</td>' +
             '<td class="px-4 py-3 text-zinc-500 dark:text-zinc-400">' + formatTime(d.start_time) + '</td>' +
             '<td class="px-4 py-3">' + formatDuration(d.duration_seconds) + '</td>' +
             '<td class="px-4 py-3 text-right tabular-nums">' + fmt1(d.distance) + ' km</td>' +

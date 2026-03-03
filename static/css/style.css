@@ -119,6 +119,50 @@
     box-shadow: 0 0 0 1px #0284c7;
 }
 
+/* Badges difficulte piste */
+.piste-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.4;
+}
+
+.piste-badge .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+
+.piste-badge.green { background: #dcfce7; color: #166534; }
+.piste-badge.green .dot { background: #22c55e; }
+.dark .piste-badge.green { background: rgba(34,197,94,0.15); color: #86efac; }
+
+.piste-badge.blue { background: #dbeafe; color: #1e40af; }
+.piste-badge.blue .dot { background: #3b82f6; }
+.dark .piste-badge.blue { background: rgba(59,130,246,0.15); color: #93bbfd; }
+
+.piste-badge.red { background: #fee2e2; color: #991b1b; }
+.piste-badge.red .dot { background: #ef4444; }
+.dark .piste-badge.red { background: rgba(239,68,68,0.15); color: #fca5a5; }
+
+.piste-badge.black { background: #e4e4e7; color: #18181b; }
+.piste-badge.black .dot { background: #18181b; }
+.dark .piste-badge.black { background: rgba(255,255,255,0.1); color: #e4e4e7; }
+.dark .piste-badge.black .dot { background: #e4e4e7; }
+
+.piste-badge.orange { background: #ffedd5; color: #9a3412; }
+.piste-badge.orange .dot { background: #f97316; }
+.dark .piste-badge.orange { background: rgba(249,115,22,0.15); color: #fdba74; }
+
+/* Descente non matchee */
+.unmatched-row {
+    opacity: 0.5;
+}
+
 /* Smooth page transitions */
 main {
     animation: fade-in 0.2s ease-out;

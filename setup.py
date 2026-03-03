@@ -79,6 +79,22 @@ def setup():
         CREATE INDEX IF NOT EXISTS idx_points_track ON track_points(track_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_date ON sessions(date);
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+        CREATE TABLE IF NOT EXISTS osm_pistes (
+            osm_id INTEGER PRIMARY KEY,
+            name TEXT,
+            difficulty TEXT,
+            geometry TEXT,
+            bbox_min_lat REAL, bbox_max_lat REAL,
+            bbox_min_lon REAL, bbox_max_lon REAL,
+            fetched_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS osm_fetch_zones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            min_lat REAL, max_lat REAL,
+            min_lon REAL, max_lon REAL,
+            fetched_at TEXT
+        );
     """)
 
     # Migration : ajouter user_id si manquant (installations existantes)
@@ -86,6 +102,15 @@ def setup():
     if 'user_id' not in cols:
         cursor.execute("ALTER TABLE sessions ADD COLUMN user_id INTEGER REFERENCES users(id)")
         logger.info("Migration : colonne user_id ajoutée à la table sessions")
+
+    # Migration : colonnes piste matching sur tracks
+    track_cols = [row[1] for row in cursor.execute("PRAGMA table_info(tracks)").fetchall()]
+    if 'piste_osm_id' not in track_cols:
+        cursor.execute("ALTER TABLE tracks ADD COLUMN piste_osm_id INTEGER")
+        cursor.execute("ALTER TABLE tracks ADD COLUMN piste_name TEXT")
+        cursor.execute("ALTER TABLE tracks ADD COLUMN piste_difficulty TEXT")
+        cursor.execute("ALTER TABLE tracks ADD COLUMN match_confidence REAL")
+        logger.info("Migration : colonnes piste matching ajoutées à tracks")
 
     conn.commit()
     conn.close()
