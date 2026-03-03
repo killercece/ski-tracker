@@ -4,7 +4,7 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.4.0'
+__version__ = '1.4.1'
 
 import os
 import logging
@@ -143,6 +143,15 @@ def init_db():
         conn.execute("ALTER TABLE tracks ADD COLUMN piste_difficulty TEXT")
         conn.execute("ALTER TABLE tracks ADD COLUMN match_confidence REAL")
         logger.info("Migration : colonnes piste matching ajoutées à tracks")
+    # v1.4.1 : purger cache OSM et matchs pour re-fetch avec ref/piste:ref
+    osm_version = conn.execute(
+        "SELECT fetched_at FROM osm_fetch_zones ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if osm_version and osm_version[0] < '2026-03-04':
+        conn.execute("DELETE FROM osm_pistes")
+        conn.execute("DELETE FROM osm_fetch_zones")
+        conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
+        logger.info("Migration v1.4.1 : cache OSM purgé pour re-fetch avec ref")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
@@ -601,7 +610,7 @@ def fetch_osm_pistes(min_lat, max_lat, min_lon, max_lon):
             continue
 
         osm_id = el['id']
-        name = tags.get('name') or tags.get('piste:name') or ''
+        name = tags.get('name') or tags.get('piste:name') or tags.get('ref') or tags.get('piste:ref') or ''
         difficulty = tags.get('piste:difficulty', 'unknown')
 
         # Construire la géométrie
@@ -762,10 +771,19 @@ def match_track_to_piste(track_id):
             best_piste = piste
 
     if best_piste and best_score >= MATCH_MIN_SCORE:
+        # Fallback nom : difficulté traduite si pas de nom OSM
+        piste_name = best_piste['name']
+        if not piste_name:
+            diff_labels = {
+                'novice': 'Verte', 'easy': 'Verte',
+                'intermediate': 'Bleue', 'advanced': 'Rouge',
+                'expert': 'Noire', 'freeride': 'Freeride'
+            }
+            piste_name = diff_labels.get(best_piste['difficulty'], 'Piste')
         db.execute("""
             UPDATE tracks SET piste_osm_id = ?, piste_name = ?, piste_difficulty = ?, match_confidence = ?
             WHERE id = ?
-        """, (best_piste['osm_id'], best_piste['name'], best_piste['difficulty'],
+        """, (best_piste['osm_id'], piste_name, best_piste['difficulty'],
               round(best_score, 2), track_id))
     else:
         # Pas de match suffisant
