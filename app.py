@@ -4,7 +4,7 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.4.3'
+__version__ = '1.4.4'
 
 import os
 import logging
@@ -988,21 +988,18 @@ def _build_reference_lookup():
 
 
 def _lookup_reference(norm, lookup):
-    """Cherche un nom normalisé dans le lookup avec fallback substring."""
+    """Cherche un nom normalisé dans le lookup (exact match après normalisation)."""
     if not norm:
         return None
-    # Match exact
-    if norm in lookup:
-        return lookup[norm]
-    # Match substring : le nom OSM contient le nom ref ou vice versa
-    for key, ref in lookup.items():
-        if len(key) >= 4 and len(norm) >= 4 and (key in norm or norm in key):
-            return ref
-    return None
+    return lookup.get(norm)
 
 
 def _correct_from_reference(session_id):
-    """Corrige les difficultés des pistes matchées via le fichier de référence officiel."""
+    """Corrige les pistes matchées via le fichier de référence officiel.
+
+    - Piste trouvée dans la référence → difficulté corrigée
+    - Piste NON trouvée → nom effacé (seule la référence officielle fait foi)
+    """
     db = get_db()
     lookup = _build_reference_lookup()
     if not lookup:
@@ -1016,18 +1013,26 @@ def _correct_from_reference(session_id):
     """, (session_id,)).fetchall()
 
     corrected = 0
+    cleared = 0
     for track in matched:
         norm = _normalize_piste_name(track['piste_name'])
         ref = _lookup_reference(norm, lookup)
-        if ref and track['piste_difficulty'] != ref['difficulty']:
-            db.execute("UPDATE tracks SET piste_difficulty = ? WHERE id = ?",
-                       (ref['difficulty'], track['id']))
-            corrected += 1
+        if ref:
+            # Piste officielle → corriger la difficulté si besoin
+            if track['piste_difficulty'] != ref['difficulty']:
+                db.execute("UPDATE tracks SET piste_difficulty = ? WHERE id = ?",
+                           (ref['difficulty'], track['id']))
+                corrected += 1
+        else:
+            # Nom OSM non vérifié → effacer le nom
+            db.execute("UPDATE tracks SET piste_name = NULL WHERE id = ?",
+                       (track['id'],))
+            cleared += 1
 
-    if corrected:
+    if corrected or cleared:
         db.commit()
-        logger.info("Correction difficultés : %d pistes corrigées depuis référence officielle (session %d)",
-                    corrected, session_id)
+        logger.info("Référence officielle (session %d) : %d difficultés corrigées, %d noms non-officiels effacés",
+                    session_id, corrected, cleared)
 
 
 def match_session_pistes(session_id):
