@@ -4,9 +4,6 @@
 // Utilitaires
 // ---------------------------------------------------------------------------
 
-/**
- * Wrapper fetch avec gestion d'erreurs
- */
 async function api(url, options) {
     try {
         var res = await fetch(url, options);
@@ -21,9 +18,6 @@ async function api(url, options) {
     }
 }
 
-/**
- * Affiche un toast de notification
- */
 function showToast(message, type) {
     type = type || 'success';
     var container = document.getElementById('toast-container');
@@ -34,7 +28,6 @@ function showToast(message, type) {
     toast.className = 'toast-enter flex items-center gap-2 px-4 py-3 rounded-lg text-white text-sm font-medium shadow-lg ' + bgClass;
     toast.textContent = message;
     container.appendChild(toast);
-
     setTimeout(function() {
         toast.classList.remove('toast-enter');
         toast.classList.add('toast-exit');
@@ -42,60 +35,44 @@ function showToast(message, type) {
     }, 3000);
 }
 
-/**
- * Formate les secondes en HH:MM ou HH:MM:SS
- */
 function formatDuration(seconds) {
     if (!seconds && seconds !== 0) return '--:--';
     var h = Math.floor(seconds / 3600);
     var m = Math.floor((seconds % 3600) / 60);
     var s = Math.floor(seconds % 60);
-    if (h > 0) {
-        return h + 'h' + String(m).padStart(2, '0');
-    }
+    if (h > 0) return h + 'h' + String(m).padStart(2, '0');
     return m + ':' + String(s).padStart(2, '0');
 }
 
-/**
- * Formate une date ISO en format lisible
- */
 function formatDate(dateStr) {
     if (!dateStr) return '';
     try {
-        var d = new Date(dateStr);
+        var d = new Date(dateStr + 'T12:00:00');
         return d.toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' });
-    } catch (e) {
-        return dateStr;
-    }
+    } catch (e) { return dateStr; }
 }
 
-/**
- * Extrait l'heure d'une date ISO
- */
 function formatTime(dateStr) {
     if (!dateStr) return '--:--';
     try {
         var d = new Date(dateStr);
         return d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
-    } catch (e) {
-        return '--:--';
-    }
+    } catch (e) { return '--:--'; }
 }
 
-/**
- * Formate un nombre avec 1 decimale
- */
 function fmt1(n) {
     if (n == null || isNaN(n)) return '--';
     return Number(n).toFixed(1);
 }
 
-/**
- * Formate un nombre sans decimale
- */
 function fmt0(n) {
     if (n == null || isNaN(n)) return '--';
     return Math.round(Number(n)).toLocaleString('fr-FR');
+}
+
+function setText(id, value) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = value;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,63 +121,232 @@ function toggleSidebar() {
 async function loadGlobalStats() {
     try {
         var data = await api('/api/stats');
-        document.getElementById('stat-sessions').textContent = data.total_sessions || 0;
-        document.getElementById('stat-distance').textContent = fmt1(data.total_distance);
-        document.getElementById('stat-elevation').textContent = fmt0(data.total_elevation_gain);
-        document.getElementById('stat-max-speed').textContent = fmt1(data.max_speed);
-        document.getElementById('stat-descents').textContent = data.total_descents || 0;
-    } catch (e) {
-        // Toast deja affiche par api()
-    }
+        setText('stat-sessions', data.total_sessions || 0);
+        setText('stat-distance', fmt1(data.total_distance));
+        setText('stat-elevation', fmt0(data.total_elevation_gain));
+        setText('stat-max-speed', fmt1(data.max_speed));
+        setText('stat-descents', data.total_descents || 0);
+    } catch (e) {}
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard : Liste des sessions
+// Dashboard : Navigation par date
 // ---------------------------------------------------------------------------
 
-async function loadSessions() {
-    var listEl = document.getElementById('sessions-list');
-    var emptyEl = document.getElementById('sessions-empty');
-    if (!listEl) return;
+var availableDates = [];
+var currentDateIndex = -1;
+var dayMap = null;
+var dayTrackLayers = {};
+var sessionsCache = null;
+
+async function loadAvailableDates() {
+    try {
+        var dates = await api('/api/dates');
+        availableDates = dates;
+
+        if (dates.length > 0) {
+            document.getElementById('date-picker').value = dates[0];
+            currentDateIndex = 0;
+            sessionsCache = null;
+            loadDayData(dates[0]);
+        } else {
+            document.getElementById('no-day-selected').classList.remove('hidden');
+            document.getElementById('day-content').classList.add('hidden');
+        }
+        updateNavButtons();
+    } catch (e) {}
+}
+
+function updateNavButtons() {
+    var prevBtn = document.getElementById('prev-day-btn');
+    var nextBtn = document.getElementById('next-day-btn');
+    if (prevBtn) prevBtn.disabled = currentDateIndex >= availableDates.length - 1;
+    if (nextBtn) nextBtn.disabled = currentDateIndex <= 0;
+}
+
+function prevDay() {
+    if (currentDateIndex < availableDates.length - 1) {
+        currentDateIndex++;
+        var date = availableDates[currentDateIndex];
+        document.getElementById('date-picker').value = date;
+        loadDayData(date);
+        updateNavButtons();
+    }
+}
+
+function nextDay() {
+    if (currentDateIndex > 0) {
+        currentDateIndex--;
+        var date = availableDates[currentDateIndex];
+        document.getElementById('date-picker').value = date;
+        loadDayData(date);
+        updateNavButtons();
+    }
+}
+
+async function loadDayData(dateStr) {
+    var idx = availableDates.indexOf(dateStr);
+    if (idx >= 0) currentDateIndex = idx;
+    updateNavButtons();
 
     try {
-        var sessions = await api('/api/sessions');
+        if (!sessionsCache) {
+            sessionsCache = await api('/api/sessions');
+        }
+        var sess = sessionsCache.find(function(s) { return s.date === dateStr; });
 
-        if (!sessions || sessions.length === 0) {
-            listEl.innerHTML = '';
-            emptyEl.classList.remove('hidden');
+        if (!sess) {
+            document.getElementById('no-day-selected').classList.remove('hidden');
+            document.getElementById('day-content').classList.add('hidden');
             return;
         }
 
-        emptyEl.classList.add('hidden');
-        listEl.innerHTML = sessions.map(function(s) {
-            return '<div class="session-card rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 cursor-pointer" onclick="window.location.href=\'/session/' + s.id + '\'">' +
-                '<div class="flex items-start justify-between gap-2">' +
-                    '<div class="min-w-0">' +
-                        '<h3 class="font-semibold truncate">' + escapeHtml(s.name) + '</h3>' +
-                        '<p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">' + formatDate(s.date) + '</p>' +
-                    '</div>' +
-                    '<button onclick="event.stopPropagation(); openDeleteModal(' + s.id + ')" class="shrink-0 p-1.5 rounded-lg text-zinc-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors" title="Supprimer">' +
-                        '<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0"/></svg>' +
-                    '</button>' +
-                '</div>' +
-                '<div class="grid grid-cols-2 gap-3 mt-4 text-sm">' +
-                    '<div><span class="text-zinc-500 dark:text-zinc-400">Distance</span><p class="font-semibold tabular-nums">' + fmt1(s.total_distance) + ' km</p></div>' +
-                    '<div><span class="text-zinc-500 dark:text-zinc-400">Denivele</span><p class="font-semibold tabular-nums">' + fmt0(s.total_elevation_loss) + ' m</p></div>' +
-                    '<div><span class="text-zinc-500 dark:text-zinc-400">Descentes</span><p class="font-semibold tabular-nums">' + (s.num_descents || 0) + '</p></div>' +
-                    '<div><span class="text-zinc-500 dark:text-zinc-400">Vit. max</span><p class="font-semibold tabular-nums">' + fmt1(s.max_speed) + ' km/h</p></div>' +
-                '</div>' +
-            '</div>';
-        }).join('');
-    } catch (e) {
-        // Toast deja affiche
-    }
+        document.getElementById('no-day-selected').classList.add('hidden');
+        document.getElementById('day-content').classList.remove('hidden');
+
+        var tracksData = await api('/api/sessions/' + sess.id + '/tracks');
+
+        setText('day-distance', fmt1(sess.total_distance));
+        setText('day-elev-gain', fmt0(sess.total_elevation_gain));
+        setText('day-elev-loss', fmt0(sess.total_elevation_loss));
+        setText('day-duration', formatDuration(sess.duration_seconds));
+        setText('day-avg-speed', fmt1(sess.avg_speed));
+        setText('day-max-speed', fmt1(sess.max_speed));
+        setText('day-descents', sess.num_descents || 0);
+
+        var flatTracks = tracksData.map(function(item) {
+            var flat = Object.assign({}, item.track);
+            flat.points = item.points;
+            return flat;
+        });
+        renderDayMap(flatTracks);
+        renderDayDescentsTable(flatTracks);
+    } catch (e) {}
 }
 
-function escapeHtml(str) {
-    var div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
+// ---------------------------------------------------------------------------
+// Dashboard : Carte du jour
+// ---------------------------------------------------------------------------
+
+function renderDayMap(tracks) {
+    var mapEl = document.getElementById('day-map');
+    if (!mapEl || !tracks || tracks.length === 0) return;
+
+    if (dayMap) { dayMap.remove(); dayMap = null; }
+    dayTrackLayers = {};
+
+    dayMap = L.map('day-map', { zoomControl: true, scrollWheelZoom: true });
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap', maxZoom: 18
+    }).addTo(dayMap);
+
+    var allBounds = [];
+    var overlays = {
+        'Descentes': L.layerGroup(),
+        'Remontees': L.layerGroup(),
+        'Pauses': L.layerGroup()
+    };
+
+    var colors = { descent: '#ef4444', lift: '#3b82f6', pause: '#9ca3af' };
+    var labels = { descent: 'Descente', lift: 'Remontee', pause: 'Pause' };
+    var layerNames = { descent: 'Descentes', lift: 'Remontees', pause: 'Pauses' };
+
+    var descentCounter = 0;
+    tracks.forEach(function(track) {
+        if (track.segment_type === 'descent') {
+            descentCounter++;
+            track.descent_number = descentCounter;
+        }
+        if (!track.points || track.points.length < 2) return;
+
+        var latlngs = track.points.map(function(p) { return [p.latitude, p.longitude]; });
+
+        var polyline = L.polyline(latlngs, {
+            color: colors[track.segment_type] || '#9ca3af',
+            weight: 4, opacity: 0.85
+        });
+
+        var popupContent = '<div style="font-family: Inter, sans-serif; font-size: 13px; line-height: 1.5;">' +
+            '<strong>' + (labels[track.segment_type] || track.segment_type) + '</strong>';
+        if (track.segment_type === 'descent') popupContent += ' #' + track.descent_number;
+        popupContent += '<br>Distance : ' + fmt1(track.distance) + ' km<br>' +
+            'Denivele : ' + fmt0(Math.abs(track.elevation_change)) + ' m<br>' +
+            'Duree : ' + formatDuration(track.duration_seconds) + '<br>' +
+            'Vit. moy : ' + fmt1(track.avg_speed) + ' km/h';
+        if (track.segment_type === 'descent') {
+            popupContent += '<br>Vit. max : ' + fmt1(track.max_speed) + ' km/h';
+        }
+        popupContent += '</div>';
+        polyline.bindPopup(popupContent);
+
+        dayTrackLayers[track.id] = polyline;
+
+        var layerName = layerNames[track.segment_type];
+        if (overlays[layerName]) polyline.addTo(overlays[layerName]);
+
+        latlngs.forEach(function(ll) { allBounds.push(ll); });
+    });
+
+    Object.keys(overlays).forEach(function(name) { overlays[name].addTo(dayMap); });
+
+    if (allBounds.length > 0) {
+        var startIcon = L.divIcon({
+            html: '<div style="width:14px;height:14px;background:#22c55e;border:2px solid white;border-radius:50%;box-shadow:0 1px 4px rgba(0,0,0,0.3);"></div>',
+            iconSize: [14, 14], iconAnchor: [7, 7], className: ''
+        });
+        L.marker(allBounds[0], { icon: startIcon, title: 'Depart' }).bindPopup('Depart').addTo(dayMap);
+
+        var endIcon = L.divIcon({
+            html: '<div style="width:14px;height:14px;background:#ef4444;border:2px solid white;border-radius:50%;box-shadow:0 1px 4px rgba(0,0,0,0.3);"></div>',
+            iconSize: [14, 14], iconAnchor: [7, 7], className: ''
+        });
+        L.marker(allBounds[allBounds.length - 1], { icon: endIcon, title: 'Arrivee' }).bindPopup('Arrivee').addTo(dayMap);
+
+        dayMap.fitBounds(allBounds, { padding: [30, 30] });
+    }
+
+    L.control.layers(null, overlays, { collapsed: false }).addTo(dayMap);
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard : Tableau des descentes du jour
+// ---------------------------------------------------------------------------
+
+function renderDayDescentsTable(tracks) {
+    var tbody = document.getElementById('day-descents-table');
+    var emptyEl = document.getElementById('day-descents-empty');
+    if (!tbody) return;
+
+    var descents = tracks.filter(function(t) { return t.segment_type === 'descent'; });
+
+    if (descents.length === 0) {
+        tbody.innerHTML = '';
+        if (emptyEl) emptyEl.classList.remove('hidden');
+        return;
+    }
+
+    if (emptyEl) emptyEl.classList.add('hidden');
+
+    tbody.innerHTML = descents.map(function(d, i) {
+        return '<tr onclick="zoomToDayTrack(' + d.id + ')" class="cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-800/50">' +
+            '<td class="px-4 py-3 font-medium">' + (i + 1) + '</td>' +
+            '<td class="px-4 py-3 text-zinc-500 dark:text-zinc-400">' + formatTime(d.start_time) + '</td>' +
+            '<td class="px-4 py-3">' + formatDuration(d.duration_seconds) + '</td>' +
+            '<td class="px-4 py-3 text-right tabular-nums">' + fmt1(d.distance) + ' km</td>' +
+            '<td class="px-4 py-3 text-right tabular-nums">' + fmt0(Math.abs(d.elevation_change)) + ' m</td>' +
+            '<td class="px-4 py-3 text-right tabular-nums">' + fmt1(d.avg_speed) + ' km/h</td>' +
+            '<td class="px-4 py-3 text-right tabular-nums">' + fmt1(d.max_speed) + ' km/h</td>' +
+        '</tr>';
+    }).join('');
+}
+
+function zoomToDayTrack(trackId) {
+    var layer = dayTrackLayers[trackId];
+    if (layer && dayMap) {
+        dayMap.fitBounds(layer.getBounds(), { padding: [50, 50], maxZoom: 16 });
+        layer.openPopup();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +360,6 @@ function initUpload() {
     var fileInput = document.getElementById('file-input');
     if (!dropZone || !fileInput) return;
 
-    // Drag & drop
     ['dragenter', 'dragover'].forEach(function(evt) {
         dropZone.addEventListener(evt, function(e) {
             e.preventDefault();
@@ -238,38 +383,26 @@ function initUpload() {
         }
     });
 
-    // Selection classique
     fileInput.addEventListener('change', function() {
-        if (fileInput.files.length > 0) {
-            selectFile(fileInput.files[0]);
-        }
+        if (fileInput.files.length > 0) selectFile(fileInput.files[0]);
     });
 
-    // Bouton clear
     var clearBtn = document.getElementById('file-clear');
-    if (clearBtn) {
-        clearBtn.addEventListener('click', clearFile);
-    }
+    if (clearBtn) clearBtn.addEventListener('click', clearFile);
 }
 
 function selectFile(file) {
     selectedFile = file;
     document.getElementById('file-info').classList.remove('hidden');
     document.getElementById('file-name').textContent = file.name;
-    document.getElementById('session-name-group').classList.remove('hidden');
     document.getElementById('upload-btn').classList.remove('hidden');
     document.getElementById('upload-btn').disabled = false;
-
-    // Pre-remplir le nom de session avec le nom du fichier sans extension
-    var name = file.name.replace(/\.gpx$/i, '').replace(/[_-]/g, ' ');
-    document.getElementById('session-name').value = name;
 }
 
 function clearFile() {
     selectedFile = null;
     document.getElementById('file-input').value = '';
     document.getElementById('file-info').classList.add('hidden');
-    document.getElementById('session-name-group').classList.add('hidden');
     document.getElementById('upload-btn').classList.add('hidden');
     document.getElementById('upload-progress').classList.add('hidden');
 }
@@ -287,12 +420,7 @@ async function uploadGPX() {
 
     var formData = new FormData();
     formData.append('file', selectedFile);
-    var sessionName = document.getElementById('session-name').value.trim();
-    if (sessionName) {
-        formData.append('name', sessionName);
-    }
 
-    // Upload avec suivi de progression
     var xhr = new XMLHttpRequest();
     xhr.open('POST', '/api/upload');
 
@@ -306,10 +434,16 @@ async function uploadGPX() {
 
     xhr.onload = function() {
         if (xhr.status >= 200 && xhr.status < 300) {
-            showToast('Session importee avec succes');
+            var data = {};
+            try { data = JSON.parse(xhr.responseText); } catch (e) {}
+            var msg = 'Import reussi';
+            if (data.new_points > 0) msg += ' : ' + data.new_points + ' nouveaux points';
+            if (data.days_updated) msg += ' sur ' + data.days_updated + ' jour(s)';
+            showToast(msg);
             clearFile();
+            sessionsCache = null;
             loadGlobalStats();
-            loadSessions();
+            loadAvailableDates();
         } else {
             var err = 'Erreur lors de l\'import';
             try {
@@ -330,254 +464,4 @@ async function uploadGPX() {
     };
 
     xhr.send(formData);
-}
-
-// ---------------------------------------------------------------------------
-// Dashboard : Suppression de session
-// ---------------------------------------------------------------------------
-
-var deleteSessionId = null;
-
-function openDeleteModal(id) {
-    deleteSessionId = id;
-    var modal = document.getElementById('delete-modal');
-    modal.classList.remove('hidden');
-    modal.classList.add('flex');
-
-    var confirmBtn = document.getElementById('confirm-delete-btn');
-    confirmBtn.onclick = confirmDelete;
-}
-
-function closeDeleteModal() {
-    var modal = document.getElementById('delete-modal');
-    modal.classList.add('hidden');
-    modal.classList.remove('flex');
-    deleteSessionId = null;
-}
-
-async function confirmDelete() {
-    if (!deleteSessionId) return;
-    try {
-        await api('/api/sessions/' + deleteSessionId, { method: 'DELETE' });
-        showToast('Session supprimee');
-        closeDeleteModal();
-        loadGlobalStats();
-        loadSessions();
-    } catch (e) {
-        // Toast deja affiche
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Session detail : Chargement des donnees
-// ---------------------------------------------------------------------------
-
-var sessionMap = null;
-var trackLayers = {};
-
-async function loadSessionDetail(sessionId) {
-    try {
-        // Charger les donnees en parallele
-        var results = await Promise.all([
-            api('/api/sessions/' + sessionId),
-            api('/api/sessions/' + sessionId + '/tracks')
-        ]);
-        var sessionData = results[0];
-        var tracksData = results[1];
-
-        renderSessionStats(sessionData.session);
-        // Aplatir la structure : [{track: {...}, points: [...]}] => [{...trackFields, points: [...]}]
-        var flatTracks = tracksData.map(function(item) {
-            var flat = Object.assign({}, item.track);
-            flat.points = item.points;
-            return flat;
-        });
-        renderMap(flatTracks);
-        renderDescentsTable(flatTracks);
-    } catch (e) {
-        // Toast deja affiche
-    }
-}
-
-function renderSessionStats(session) {
-    setText('detail-distance', fmt1(session.total_distance));
-    setText('detail-elev-gain', fmt0(session.total_elevation_gain));
-    setText('detail-elev-loss', fmt0(session.total_elevation_loss));
-    setText('detail-duration', formatDuration(session.duration_seconds));
-    setText('detail-avg-speed', fmt1(session.avg_speed));
-    setText('detail-max-speed', fmt1(session.max_speed));
-    setText('detail-descents', session.num_descents || 0);
-}
-
-function setText(id, value) {
-    var el = document.getElementById(id);
-    if (el) el.textContent = value;
-}
-
-// ---------------------------------------------------------------------------
-// Session detail : Carte Leaflet
-// ---------------------------------------------------------------------------
-
-function renderMap(tracks) {
-    var mapEl = document.getElementById('map');
-    if (!mapEl || !tracks || tracks.length === 0) return;
-
-    // Initialiser la carte
-    sessionMap = L.map('map', {
-        zoomControl: true,
-        scrollWheelZoom: true
-    });
-
-    // Fond OpenStreetMap
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap',
-        maxZoom: 18
-    }).addTo(sessionMap);
-
-    var allBounds = [];
-    var overlays = {
-        'Descentes': L.layerGroup(),
-        'Remontees': L.layerGroup(),
-        'Pauses': L.layerGroup()
-    };
-
-    var colors = {
-        descent: '#ef4444',
-        lift: '#3b82f6',
-        pause: '#9ca3af'
-    };
-
-    var labels = {
-        descent: 'Descente',
-        lift: 'Remontee',
-        pause: 'Pause'
-    };
-
-    var layerNames = {
-        descent: 'Descentes',
-        lift: 'Remontees',
-        pause: 'Pauses'
-    };
-
-    var descentCounter = 0;
-    tracks.forEach(function(track, index) {
-        if (track.segment_type === 'descent') {
-            descentCounter++;
-            track.descent_number = descentCounter;
-        }
-        if (!track.points || track.points.length < 2) return;
-
-        var latlngs = track.points.map(function(p) {
-            return [p.latitude, p.longitude];
-        });
-
-        var polyline = L.polyline(latlngs, {
-            color: colors[track.segment_type] || '#9ca3af',
-            weight: 4,
-            opacity: 0.85
-        });
-
-        // Popup avec stats du segment
-        var popupContent = '<div style="font-family: Inter, sans-serif; font-size: 13px; line-height: 1.5;">' +
-            '<strong>' + (labels[track.segment_type] || track.segment_type) + '</strong>';
-        if (track.segment_type === 'descent') {
-            popupContent += ' #' + track.descent_number;
-        }
-        popupContent += '<br>' +
-            'Distance : ' + fmt1(track.distance) + ' km<br>' +
-            'Denivele : ' + fmt0(Math.abs(track.elevation_change)) + ' m<br>' +
-            'Duree : ' + formatDuration(track.duration_seconds) + '<br>' +
-            'Vit. moy : ' + fmt1(track.avg_speed) + ' km/h';
-        if (track.segment_type === 'descent') {
-            popupContent += '<br>Vit. max : ' + fmt1(track.max_speed) + ' km/h';
-        }
-        popupContent += '</div>';
-        polyline.bindPopup(popupContent);
-
-        // Stocker la reference pour le zoom depuis le tableau
-        trackLayers[track.id] = polyline;
-
-        var layerName = layerNames[track.segment_type];
-        if (overlays[layerName]) {
-            polyline.addTo(overlays[layerName]);
-        }
-
-        latlngs.forEach(function(ll) { allBounds.push(ll); });
-    });
-
-    // Ajouter les couches a la carte
-    Object.keys(overlays).forEach(function(name) {
-        overlays[name].addTo(sessionMap);
-    });
-
-    // Marqueurs depart et arrivee
-    if (allBounds.length > 0) {
-        // Premier point = depart
-        var startIcon = L.divIcon({
-            html: '<div style="width:14px;height:14px;background:#22c55e;border:2px solid white;border-radius:50%;box-shadow:0 1px 4px rgba(0,0,0,0.3);"></div>',
-            iconSize: [14, 14],
-            iconAnchor: [7, 7],
-            className: ''
-        });
-        L.marker(allBounds[0], { icon: startIcon, title: 'Depart' })
-            .bindPopup('Depart')
-            .addTo(sessionMap);
-
-        // Dernier point = arrivee
-        var endIcon = L.divIcon({
-            html: '<div style="width:14px;height:14px;background:#ef4444;border:2px solid white;border-radius:50%;box-shadow:0 1px 4px rgba(0,0,0,0.3);"></div>',
-            iconSize: [14, 14],
-            iconAnchor: [7, 7],
-            className: ''
-        });
-        L.marker(allBounds[allBounds.length - 1], { icon: endIcon, title: 'Arrivee' })
-            .bindPopup('Arrivee')
-            .addTo(sessionMap);
-
-        // Fit bounds
-        sessionMap.fitBounds(allBounds, { padding: [30, 30] });
-    }
-
-    // Controle de couches
-    L.control.layers(null, overlays, { collapsed: false }).addTo(sessionMap);
-}
-
-// ---------------------------------------------------------------------------
-// Session detail : Tableau des descentes
-// ---------------------------------------------------------------------------
-
-function renderDescentsTable(tracks) {
-    var tbody = document.getElementById('descents-table');
-    var emptyEl = document.getElementById('descents-empty');
-    if (!tbody) return;
-
-    var descents = tracks.filter(function(t) { return t.segment_type === 'descent'; });
-
-    if (descents.length === 0) {
-        tbody.innerHTML = '';
-        if (emptyEl) emptyEl.classList.remove('hidden');
-        return;
-    }
-
-    if (emptyEl) emptyEl.classList.add('hidden');
-
-    tbody.innerHTML = descents.map(function(d, i) {
-        return '<tr onclick="zoomToTrack(' + d.id + ')" class="hover:bg-zinc-50 dark:hover:bg-zinc-800/50">' +
-            '<td class="px-4 py-3 font-medium">' + (i + 1) + '</td>' +
-            '<td class="px-4 py-3 text-zinc-500 dark:text-zinc-400">' + formatTime(d.start_time) + '</td>' +
-            '<td class="px-4 py-3">' + formatDuration(d.duration_seconds) + '</td>' +
-            '<td class="px-4 py-3 text-right tabular-nums">' + fmt1(d.distance) + ' km</td>' +
-            '<td class="px-4 py-3 text-right tabular-nums">' + fmt0(Math.abs(d.elevation_change)) + ' m</td>' +
-            '<td class="px-4 py-3 text-right tabular-nums">' + fmt1(d.avg_speed) + ' km/h</td>' +
-            '<td class="px-4 py-3 text-right tabular-nums">' + fmt1(d.max_speed) + ' km/h</td>' +
-        '</tr>';
-    }).join('');
-}
-
-function zoomToTrack(trackId) {
-    var layer = trackLayers[trackId];
-    if (layer && sessionMap) {
-        sessionMap.fitBounds(layer.getBounds(), { padding: [50, 50], maxZoom: 16 });
-        layer.openPopup();
-    }
 }

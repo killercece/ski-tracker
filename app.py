@@ -4,11 +4,12 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.1.0'
+__version__ = '1.2.0'
 
 import os
 import logging
 import sqlite3
+from collections import defaultdict
 from datetime import datetime
 from functools import wraps
 from math import radians, cos, sin, asin, sqrt
@@ -327,6 +328,9 @@ def compute_point_metrics(points):
             dt = (t2 - t1).total_seconds()
 
         speed = (dist / dt * 3.6) if dt > 0 else 0.0
+        # Filtrer le bruit GPS : vitesse max réaliste pour le ski = 150 km/h
+        if speed > 150.0:
+            speed = 0.0
         elev_delta = (curr['elevation'] or 0) - (prev['elevation'] or 0)
 
         speeds.append(speed)
@@ -337,7 +341,7 @@ def compute_point_metrics(points):
 
 def classify_point(speed, elev_delta):
     """Classifie un point individuel en phase."""
-    if speed < 2.0:
+    if speed < 3.0:
         return 'pause'
     if elev_delta < 0 and speed > 5.0:
         return 'descent'
@@ -524,51 +528,6 @@ def compute_session_stats(segments):
     return stats
 
 
-def save_session(db, name, date_str, stats, segments, user_id):
-    """Sauvegarde une session complète en BDD (session + tracks + points)."""
-    cursor = db.execute(
-        """INSERT INTO sessions
-           (name, date, user_id, total_distance, total_elevation_gain, total_elevation_loss,
-            max_speed, avg_speed, num_descents, duration_seconds)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (name, date_str, user_id,
-         stats['total_distance'], stats['total_elevation_gain'],
-         stats['total_elevation_loss'], stats['max_speed'],
-         stats['avg_speed'], stats['num_descents'],
-         stats['duration_seconds'])
-    )
-    session_id = cursor.lastrowid
-
-    for seg in segments:
-        track_cursor = db.execute(
-            """INSERT INTO tracks
-               (session_id, segment_type, start_time, end_time, distance,
-                elevation_change, avg_speed, max_speed, duration_seconds)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (session_id, seg['type'], seg['start_time'], seg['end_time'],
-             seg['distance'], seg['elevation_change'], seg['avg_speed'],
-             seg['max_speed'], seg['duration_seconds'])
-        )
-        track_id = track_cursor.lastrowid
-
-        # Insertion par batch pour la performance
-        point_data = []
-        for order, pt in enumerate(seg['points']):
-            point_data.append((
-                track_id, pt['latitude'], pt['longitude'],
-                pt['elevation'], pt['time'], None, order
-            ))
-
-        db.executemany(
-            """INSERT INTO track_points
-               (track_id, latitude, longitude, elevation, time, speed, point_order)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            point_data
-        )
-
-    db.commit()
-    return session_id
-
 # ---------------------------------------------------------------------------
 # Routes — Pages
 # ---------------------------------------------------------------------------
@@ -614,7 +573,7 @@ def health():
 @app.route('/api/upload', methods=['POST'])
 @login_required
 def upload_gpx():
-    """Upload et traitement d'un fichier GPX."""
+    """Upload et traitement d'un fichier GPX avec groupement par jour et déduplication."""
     if 'file' not in request.files:
         return jsonify({'error': 'Aucun fichier fourni'}), 400
 
@@ -651,35 +610,131 @@ def upload_gpx():
         if not points:
             return jsonify({'error': 'Aucun point GPS trouvé dans le fichier'}), 400
 
-        # Nom de session dérivé du nom de fichier
-        session_name = Path(file.filename).stem.replace('_', ' ').replace('-', ' ')
+        # Grouper les points par date
+        points_by_date = defaultdict(list)
+        for pt in points:
+            if pt['time']:
+                date_str = datetime.fromisoformat(pt['time']).strftime('%Y-%m-%d')
+            else:
+                date_str = datetime.now().strftime('%Y-%m-%d')
+            points_by_date[date_str].append(pt)
 
-        # Date de session extraite du premier point
-        session_date = datetime.now().strftime('%Y-%m-%d')
-        if points[0]['time']:
-            try:
-                session_date = datetime.fromisoformat(points[0]['time']).strftime('%Y-%m-%d')
-            except (ValueError, TypeError):
-                pass
-
-        # Détection des segments
-        segments = detect_segments(points)
-
-        # Calcul des stats
-        stats = compute_session_stats(segments)
-
-        # Sauvegarde en BDD
         db = get_db()
-        session_id = save_session(db, session_name, session_date, stats, segments, session['user_id'])
-        logger.info("Session créée : id=%d, name=%s, %d segments",
-                     session_id, session_name, len(segments))
+        user_id = session['user_id']
+        total_new_points = 0
+        days_updated = []
+
+        for date_str, new_points in points_by_date.items():
+            # Trouver ou créer la session pour ce jour
+            sess = db.execute(
+                "SELECT id FROM sessions WHERE user_id = ? AND date = ?",
+                (user_id, date_str)
+            ).fetchone()
+
+            if sess:
+                session_id = sess['id']
+                # Charger les points existants
+                existing_points = []
+                tracks = db.execute("SELECT id FROM tracks WHERE session_id = ?", (session_id,)).fetchall()
+                for track in tracks:
+                    pts = db.execute(
+                        "SELECT latitude, longitude, elevation, time FROM track_points WHERE track_id = ? ORDER BY point_order",
+                        (track['id'],)
+                    ).fetchall()
+                    existing_points.extend([dict(p) for p in pts])
+
+                # Dédupliquer : utiliser le timestamp comme clé
+                existing_timestamps = set()
+                for p in existing_points:
+                    if p['time']:
+                        existing_timestamps.add(p['time'][:19])  # Tronquer à la seconde
+
+                # Ne garder que les nouveaux points
+                unique_new = []
+                for p in new_points:
+                    ts = p['time'][:19] if p['time'] else None
+                    if ts and ts not in existing_timestamps:
+                        unique_new.append(p)
+                        existing_timestamps.add(ts)
+
+                if not unique_new and existing_points:
+                    # Rien de nouveau, skip
+                    continue
+
+                # Fusionner et trier par temps
+                all_points = existing_points + unique_new
+                all_points.sort(key=lambda p: p['time'] or '')
+                total_new_points += len(unique_new)
+
+                # Supprimer les anciens tracks et points
+                db.execute("DELETE FROM tracks WHERE session_id = ?", (session_id,))
+            else:
+                # Nouvelle session pour ce jour
+                months_fr = {
+                    'January': 'janvier', 'February': 'février', 'March': 'mars',
+                    'April': 'avril', 'May': 'mai', 'June': 'juin',
+                    'July': 'juillet', 'August': 'août', 'September': 'septembre',
+                    'October': 'octobre', 'November': 'novembre', 'December': 'décembre'
+                }
+                session_name = datetime.strptime(date_str, '%Y-%m-%d').strftime('%-d %B %Y')
+                for en, fr in months_fr.items():
+                    session_name = session_name.replace(en, fr)
+
+                cursor = db.execute(
+                    """INSERT INTO sessions (name, date, user_id, total_distance, total_elevation_gain,
+                       total_elevation_loss, max_speed, avg_speed, num_descents, duration_seconds)
+                       VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0)""",
+                    (session_name, date_str, user_id)
+                )
+                session_id = cursor.lastrowid
+                all_points = new_points
+                all_points.sort(key=lambda p: p['time'] or '')
+                total_new_points += len(new_points)
+
+            # Recalculer segments et stats
+            segments = detect_segments(all_points)
+            stats = compute_session_stats(segments)
+
+            # Sauvegarder les tracks et points
+            for seg in segments:
+                track_cursor = db.execute(
+                    """INSERT INTO tracks
+                       (session_id, segment_type, start_time, end_time, distance,
+                        elevation_change, avg_speed, max_speed, duration_seconds)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (session_id, seg['type'], seg['start_time'], seg['end_time'],
+                     seg['distance'], seg['elevation_change'], seg['avg_speed'],
+                     seg['max_speed'], seg['duration_seconds'])
+                )
+                track_id = track_cursor.lastrowid
+                point_data = [(track_id, pt['latitude'], pt['longitude'], pt['elevation'], pt['time'], None, order)
+                              for order, pt in enumerate(seg['points'])]
+                db.executemany(
+                    "INSERT INTO track_points (track_id, latitude, longitude, elevation, time, speed, point_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    point_data
+                )
+
+            # Mettre à jour les stats de la session
+            db.execute(
+                """UPDATE sessions SET
+                   total_distance = ?, total_elevation_gain = ?, total_elevation_loss = ?,
+                   max_speed = ?, avg_speed = ?, num_descents = ?, duration_seconds = ?
+                   WHERE id = ?""",
+                (stats['total_distance'], stats['total_elevation_gain'],
+                 stats['total_elevation_loss'], stats['max_speed'],
+                 stats['avg_speed'], stats['num_descents'],
+                 stats['duration_seconds'], session_id)
+            )
+
+            days_updated.append(date_str)
+
+        db.commit()
+        logger.info("Import GPX : %d jours mis à jour, %d nouveaux points", len(days_updated), total_new_points)
 
         return jsonify({
-            'id': session_id,
-            'name': session_name,
-            'date': session_date,
-            'stats': stats,
-            'num_segments': len(segments)
+            'days_updated': len(days_updated),
+            'new_points': total_new_points,
+            'dates': days_updated
         }), 201
 
     except gpxpy.gpx.GPXXMLSyntaxException:
@@ -692,6 +747,18 @@ def upload_gpx():
 # ---------------------------------------------------------------------------
 # Routes — API Données
 # ---------------------------------------------------------------------------
+
+
+@app.route('/api/dates')
+@login_required
+def api_dates():
+    """Liste les dates ayant des données pour l'utilisateur."""
+    db = get_db()
+    dates = db.execute(
+        "SELECT date FROM sessions WHERE user_id = ? ORDER BY date DESC",
+        (session['user_id'],)
+    ).fetchall()
+    return jsonify([d['date'] for d in dates])
 
 
 @app.route('/api/sessions')

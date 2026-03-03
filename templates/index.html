@@ -63,12 +63,6 @@
                 </button>
             </div>
 
-            <!-- Nom de session -->
-            <div id="session-name-group" class="hidden mt-4">
-                <label for="session-name" class="block text-sm font-medium mb-1.5">Nom de la session</label>
-                <input type="text" id="session-name" placeholder="Ex: Val Thorens - Journee poudreuse" class="w-full px-3 py-2 rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-shadow">
-            </div>
-
             <!-- Barre de progression -->
             <div id="upload-progress" class="hidden mt-4">
                 <div class="flex items-center justify-between mb-1.5">
@@ -87,33 +81,89 @@
         </div>
     </section>
 
-    <!-- Liste des sessions -->
+    <!-- Navigation par date -->
     <section>
-        <h2 class="text-lg font-semibold mb-4">Vos sessions</h2>
-        <div id="sessions-list" class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            <!-- Rempli dynamiquement par JS -->
+        <div class="flex items-center justify-between mb-4">
+            <h2 class="text-lg font-semibold">Mes journees de ski</h2>
+            <div class="flex items-center gap-2">
+                <button onclick="prevDay()" id="prev-day-btn" class="p-2 rounded-lg border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors disabled:opacity-30" disabled>
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5"/></svg>
+                </button>
+                <input type="date" id="date-picker" class="px-3 py-1.5 rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500" onchange="loadDayData(this.value)">
+                <button onclick="nextDay()" id="next-day-btn" class="p-2 rounded-lg border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors disabled:opacity-30" disabled>
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5"/></svg>
+                </button>
+            </div>
         </div>
-        <div id="sessions-empty" class="hidden rounded-xl border border-dashed border-zinc-300 dark:border-zinc-700 p-12 text-center">
-            <svg class="w-12 h-12 mx-auto text-zinc-400 dark:text-zinc-500" fill="none" stroke="currentColor" stroke-width="1" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 15a4.5 4.5 0 0 0 4.5 4.5H18a3.75 3.75 0 0 0 1.332-7.257 3 3 0 0 0-3.758-3.848 5.25 5.25 0 0 0-10.233 2.33A4.502 4.502 0 0 0 2.25 15Z"/>
-            </svg>
-            <p class="mt-4 text-sm font-medium text-zinc-500 dark:text-zinc-400">Aucune session pour le moment</p>
-            <p class="mt-1 text-xs text-zinc-400 dark:text-zinc-500">Importez un fichier GPX pour commencer</p>
+
+        <!-- Message quand pas de date selectionnee -->
+        <div id="no-day-selected" class="hidden rounded-xl border border-dashed border-zinc-300 dark:border-zinc-700 p-12 text-center">
+            <p class="text-sm text-zinc-500 dark:text-zinc-400">Selectionnez une date pour voir les details</p>
+        </div>
+
+        <!-- Contenu du jour selectionne -->
+        <div id="day-content" class="hidden space-y-6">
+            <!-- Carte -->
+            <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 overflow-hidden">
+                <div id="day-map" style="height: 400px;"></div>
+                <div class="flex flex-wrap gap-4 px-4 py-3 border-t border-zinc-200 dark:border-zinc-800 text-xs font-medium">
+                    <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 rounded-full bg-red-500"></span> Descente</span>
+                    <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 rounded-full bg-blue-500"></span> Remontee</span>
+                    <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 rounded-full bg-zinc-400"></span> Pause</span>
+                </div>
+            </div>
+
+            <!-- Stats du jour -->
+            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+                <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4">
+                    <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Distance</p>
+                    <p class="mt-2"><span id="day-distance" class="text-xl font-bold tabular-nums">--</span> <span class="text-sm text-zinc-500">km</span></p>
+                </div>
+                <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4">
+                    <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">D+/D-</p>
+                    <p class="mt-2"><span class="text-xs text-green-600">+</span><span id="day-elev-gain" class="text-xl font-bold tabular-nums">--</span><span class="text-xs text-zinc-400 mx-0.5">/</span><span class="text-xs text-red-600">-</span><span id="day-elev-loss" class="text-xl font-bold tabular-nums">--</span> <span class="text-sm text-zinc-500">m</span></p>
+                </div>
+                <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4">
+                    <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Duree</p>
+                    <p id="day-duration" class="mt-2 text-xl font-bold tabular-nums">--:--</p>
+                </div>
+                <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4">
+                    <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Vit. moy</p>
+                    <p class="mt-2"><span id="day-avg-speed" class="text-xl font-bold tabular-nums">--</span> <span class="text-sm text-zinc-500">km/h</span></p>
+                </div>
+                <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4">
+                    <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Vit. max</p>
+                    <p class="mt-2"><span id="day-max-speed" class="text-xl font-bold tabular-nums">--</span> <span class="text-sm text-zinc-500">km/h</span></p>
+                </div>
+                <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4">
+                    <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Descentes</p>
+                    <p id="day-descents" class="mt-2 text-xl font-bold tabular-nums">--</p>
+                </div>
+            </div>
+
+            <!-- Tableau des descentes -->
+            <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 overflow-hidden">
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800/50">
+                                <th class="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">#</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Heure</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Duree</th>
+                                <th class="px-4 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Distance</th>
+                                <th class="px-4 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Denivele</th>
+                                <th class="px-4 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Vit. moy</th>
+                                <th class="px-4 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Vit. max</th>
+                            </tr>
+                        </thead>
+                        <tbody id="day-descents-table" class="divide-y divide-zinc-200 dark:divide-zinc-800"></tbody>
+                    </table>
+                </div>
+                <div id="day-descents-empty" class="hidden p-8 text-center text-sm text-zinc-500">Aucune descente detectee</div>
+            </div>
         </div>
     </section>
 
-</div>
-
-<!-- Modal de confirmation de suppression -->
-<div id="delete-modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/50">
-    <div class="mx-4 w-full max-w-sm rounded-xl bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 p-6 shadow-xl">
-        <h3 class="text-lg font-semibold">Supprimer la session ?</h3>
-        <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400">Cette action est irreversible. Toutes les donnees de cette session seront perdues.</p>
-        <div class="mt-6 flex gap-3 justify-end">
-            <button onclick="closeDeleteModal()" class="px-4 py-2 rounded-lg text-sm font-medium border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">Annuler</button>
-            <button id="confirm-delete-btn" class="px-4 py-2 rounded-lg text-sm font-medium bg-red-600 hover:bg-red-700 text-white transition-colors">Supprimer</button>
-        </div>
-    </div>
 </div>
 {% endblock %}
 
@@ -121,7 +171,7 @@
 <script>
     document.addEventListener('DOMContentLoaded', function() {
         loadGlobalStats();
-        loadSessions();
+        loadAvailableDates();
         initUpload();
     });
 </script>
