@@ -376,8 +376,12 @@ function renderDayMap(tracks, sessionId) {
         var popupContent = '<div style="font-family: Inter, sans-serif; font-size: 13px; line-height: 1.5;">' +
             '<strong>' + (labels[track.segment_type] || track.segment_type) + '</strong>';
         if (track.segment_type === 'descent') popupContent += ' #' + track.descent_number;
-        if (track.piste_name) popupContent += '<br>Piste : <strong>' + track.piste_name + '</strong>';
-        if (track.piste_difficulty) popupContent += ' (' + pisteDifficultyLabel(track.piste_difficulty) + ')';
+        if (track.piste_name) {
+            popupContent += '<br>Piste : <strong>' + track.piste_name + '</strong>';
+            if (track.piste_difficulty) popupContent += ' (' + pisteDifficultyLabel(track.piste_difficulty) + ')';
+        } else if (track.piste_difficulty) {
+            popupContent += '<br>Piste : ' + pisteDifficultyLabel(track.piste_difficulty);
+        }
         popupContent += '<br>Distance : ' + fmt1(track.distance) + ' km<br>' +
             'Denivele : ' + fmt0(Math.abs(track.elevation_change)) + ' m<br>' +
             'Duree : ' + formatDuration(track.duration_seconds) + '<br>' +
@@ -481,11 +485,15 @@ function renderDayDescentsTable(tracks) {
     if (emptyEl) emptyEl.classList.add('hidden');
 
     tbody.innerHTML = descents.map(function(d, i) {
-        var rowClass = d.piste_name ? '' : ' class="unmatched-row"';
+        var isUnmatched = !d.piste_name && !d.piste_difficulty;
+        var rowClass = isUnmatched ? ' class="unmatched-row"' : '';
         var pisteBadge = '';
         if (d.piste_name) {
             var badgeClass = pisteBadgeClass(d.piste_difficulty);
             pisteBadge = '<span class="piste-badge ' + badgeClass + '"><span class="dot"></span>' + d.piste_name + '</span>';
+        } else if (d.piste_difficulty) {
+            var badgeClass = pisteBadgeClass(d.piste_difficulty);
+            pisteBadge = '<span class="piste-badge ' + badgeClass + '"><span class="dot"></span>' + pisteDifficultyLabel(d.piste_difficulty) + '</span>';
         } else {
             pisteBadge = '<span class="text-zinc-400 dark:text-zinc-600 text-xs">&mdash;</span>';
         }

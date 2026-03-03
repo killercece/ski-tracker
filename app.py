@@ -4,11 +4,13 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.4.2'
+__version__ = '1.4.3'
 
 import os
 import logging
+import re
 import sqlite3
+import unicodedata
 from collections import defaultdict
 from datetime import datetime
 from functools import wraps
@@ -152,6 +154,10 @@ def init_db():
         conn.execute("DELETE FROM osm_fetch_zones")
         conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
         logger.info("Migration v1.4.2 : cache OSM purgé pour re-fetch avec relations")
+    # v1.4.3 : purger matchs pour rematch avec correction difficultés référence
+    if osm_version and osm_version[0] < '2026-03-06':
+        conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
+        logger.info("Migration v1.4.3 : matchs purgés pour rematch avec correction difficultés")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
@@ -594,11 +600,11 @@ def _reconstruct_relation_geometry(member_ways, ways, nodes):
         return []
 
     # Ordonner et chaîner les segments bout à bout
-    geometry = [pt for _, pt in segments[0]]
+    ordered = [segments[0]]
     used = {0}
 
     for _ in range(len(segments) - 1):
-        last_node_id = segments[list(used)[-1]][-1][0] if geometry else None
+        last_node_id = ordered[-1][-1][0]
         # Trouver le segment suivant dont le début ou la fin correspond
         best_idx = None
         reverse = False
@@ -626,10 +632,16 @@ def _reconstruct_relation_geometry(member_ways, ways, nodes):
         seg = segments[best_idx]
         if reverse:
             seg = list(reversed(seg))
-        # Éviter la duplication du point de jonction
-        start = 1 if seg[0][0] == last_node_id else 0
-        geometry.extend(pt for _, pt in seg[start:])
+        ordered.append(seg)
         used.add(best_idx)
+
+    # Concaténer en évitant les doublons aux jonctions
+    geometry = [pt for _, pt in ordered[0]]
+    last_node_id = ordered[0][-1][0]
+    for seg in ordered[1:]:
+        skip = 1 if seg[0][0] == last_node_id else 0
+        geometry.extend(pt for _, pt in seg[skip:])
+        last_node_id = seg[-1][0]
 
     return geometry
 
@@ -907,15 +919,8 @@ def match_track_to_piste(track_id):
                 best_score = score
                 break
 
-    # Résoudre le nom final
-    piste_name = best_piste['name']
-    if not piste_name:
-        diff_labels = {
-            'novice': 'Verte', 'easy': 'Verte',
-            'intermediate': 'Bleue', 'advanced': 'Rouge',
-            'expert': 'Noire', 'freeride': 'Freeride'
-        }
-        piste_name = diff_labels.get(best_piste['difficulty'], 'Piste')
+    # Résoudre le nom final (NULL si la piste OSM n'a pas de nom)
+    piste_name = best_piste['name'] or None
     db.execute("""
         UPDATE tracks SET piste_osm_id = ?, piste_name = ?, piste_difficulty = ?, match_confidence = ?
         WHERE id = ?
@@ -941,58 +946,85 @@ def _load_reference_pistes():
         return []
 
 
-def _enrich_unnamed_pistes(session_id):
-    """Enrichit les noms des pistes OSM sans nom via le fichier de référence officiel."""
-    db = get_db()
+def _normalize_piste_name(name):
+    """Normalise un nom de piste pour la comparaison fuzzy.
+
+    Supprime accents, articles, apostrophes, abréviations courantes.
+    Ex: "La croix d'Antide" → "croix antide"
+        "Boulevard Goitschel" → "boulevard goitschel"
+        "Bouvreuil bleu" → "bouvreuil bleu"
+    """
+    if not name:
+        return ''
+    # Minuscules
+    s = name.lower()
+    # Supprimer les accents (NFD → strip combining marks)
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+    # Remplacer apostrophes et tirets par espace
+    s = re.sub(r"[''`\-]", ' ', s)
+    # Supprimer tout ce qui n'est pas alphanumérique ou espace
+    s = re.sub(r'[^a-z0-9 ]', '', s)
+    # Développer les abréviations courantes
+    abbreviations = {
+        'bd': 'boulevard',
+        'st': 'saint',
+    }
+    words = s.split()
+    words = [abbreviations.get(w, w) for w in words]
+    # Supprimer les articles
+    articles = {'le', 'la', 'les', 'l', 'du', 'de', 'des', 'd'}
+    words = [w for w in words if w not in articles]
+    # Normaliser les suffixes genrés (bleue→bleu, rouge est invariable)
+    words = [re.sub(r'e$', '', w) if w in ('bleue', 'verte', 'noire') else w for w in words]
+    return ' '.join(words).strip()
+
+
+def _build_reference_lookup():
+    """Construit un dictionnaire normalized_name → {name, difficulty} depuis le fichier référence."""
     ref_pistes = _load_reference_pistes()
-    if not ref_pistes:
+    lookup = {}
+    for p in ref_pistes:
+        key = _normalize_piste_name(p['name'])
+        if key:
+            lookup[key] = {'name': p['name'], 'difficulty': p['difficulty']}
+    return lookup
+
+
+def _lookup_reference(norm, lookup):
+    """Cherche un nom normalisé dans le lookup (exact match après normalisation)."""
+    if not norm:
+        return None
+    return lookup.get(norm)
+
+
+def _correct_from_reference(session_id):
+    """Corrige les difficultés des pistes matchées via le fichier de référence officiel."""
+    db = get_db()
+    lookup = _build_reference_lookup()
+    if not lookup:
         return
 
-    # Récupérer les descentes matchées mais sans vrai nom (fallback difficulté)
-    diff_labels = {'Verte', 'Bleue', 'Rouge', 'Noire', 'Freeride', 'Piste'}
     matched = db.execute("""
-        SELECT t.id, t.piste_osm_id, t.piste_name, t.piste_difficulty, t.match_confidence,
-               p.name as osm_name
+        SELECT t.id, t.piste_name, t.piste_difficulty
         FROM tracks t
-        LEFT JOIN osm_pistes p ON t.piste_osm_id = p.osm_id
         WHERE t.session_id = ? AND t.segment_type = 'descent'
-        AND t.piste_osm_id IS NOT NULL
+        AND t.piste_osm_id IS NOT NULL AND t.piste_name IS NOT NULL
     """, (session_id,)).fetchall()
 
-    # Mapping difficulté OSM → officiel
-    diff_map = {
-        'novice': 'novice', 'easy': 'novice',
-        'intermediate': 'intermediate',
-        'advanced': 'advanced',
-        'expert': 'expert', 'freeride': 'expert'
-    }
-
-    # Noms déjà utilisés (vrais noms, pas fallback)
-    used_names = {t['piste_name'] for t in matched if t['piste_name'] and t['piste_name'] not in diff_labels}
-
-    enriched = 0
+    corrected = 0
     for track in matched:
-        if track['piste_name'] and track['piste_name'] not in diff_labels:
-            continue  # A déjà un vrai nom
+        norm = _normalize_piste_name(track['piste_name'])
+        ref = _lookup_reference(norm, lookup)
+        if ref and track['piste_difficulty'] != ref['difficulty']:
+            db.execute("UPDATE tracks SET piste_difficulty = ? WHERE id = ?",
+                       (ref['difficulty'], track['id']))
+            corrected += 1
 
-        osm_diff = track['piste_difficulty'] or ''
-        ref_diff = diff_map.get(osm_diff, osm_diff)
-
-        # Chercher les pistes de référence de la même difficulté, pas encore assignées
-        candidates = [p for p in ref_pistes
-                      if p['difficulty'] == ref_diff and p['name'] not in used_names]
-
-        if len(candidates) == 1:
-            # Une seule candidate → on l'assigne
-            db.execute("UPDATE tracks SET piste_name = ? WHERE id = ?",
-                       (candidates[0]['name'], track['id']))
-            used_names.add(candidates[0]['name'])
-            enriched += 1
-
-    if enriched:
+    if corrected:
         db.commit()
-        logger.info("Enrichissement noms : %d pistes nommées depuis référence officielle (session %d)",
-                    enriched, session_id)
+        logger.info("Correction difficultés : %d pistes corrigées depuis référence officielle (session %d)",
+                    corrected, session_id)
 
 
 def match_session_pistes(session_id):
@@ -1010,8 +1042,8 @@ def match_session_pistes(session_id):
 
     db.commit()
 
-    # Enrichissement post-matching : noms depuis référence officielle
-    _enrich_unnamed_pistes(session_id)
+    # Correction des difficultés depuis la référence officielle
+    _correct_from_reference(session_id)
 
     logger.info("Matching pistes terminé pour session %d : %d descentes", session_id, len(descents))
 
