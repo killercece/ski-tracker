@@ -485,15 +485,11 @@ function renderDayDescentsTable(tracks) {
     if (emptyEl) emptyEl.classList.add('hidden');
 
     tbody.innerHTML = descents.map(function(d, i) {
-        var isUnmatched = !d.piste_name && !d.piste_difficulty;
-        var rowClass = isUnmatched ? ' class="unmatched-row"' : '';
+        var rowClass = !d.piste_name ? ' class="unmatched-row"' : '';
         var pisteBadge = '';
         if (d.piste_name) {
             var badgeClass = pisteBadgeClass(d.piste_difficulty);
             pisteBadge = '<span class="piste-badge ' + badgeClass + '"><span class="dot"></span>' + d.piste_name + '</span>';
-        } else if (d.piste_difficulty) {
-            var badgeClass = pisteBadgeClass(d.piste_difficulty);
-            pisteBadge = '<span class="piste-badge ' + badgeClass + '"><span class="dot"></span>' + pisteDifficultyLabel(d.piste_difficulty) + '</span>';
         } else {
             pisteBadge = '<span class="text-zinc-400 dark:text-zinc-600 text-xs">&mdash;</span>';
         }
