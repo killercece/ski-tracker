@@ -80,9 +80,10 @@ def haversine(lat1, lon1, lat2, lon2):
 
 
 def parse_gpx(file_content):
-    """Parse un fichier GPX et retourne la liste des points."""
+    """Parse un fichier GPX et retourne la liste des points (tracks, routes, waypoints)."""
     gpx = gpxpy.parse(file_content)
     points = []
+    # Points de tracks (cas principal)
     for track in gpx.tracks:
         for segment in track.segments:
             for point in segment.points:
@@ -92,6 +93,25 @@ def parse_gpx(file_content):
                     'elevation': point.elevation,
                     'time': point.time.isoformat() if point.time else None
                 })
+    # Fallback : points de routes
+    if not points:
+        for route in gpx.routes:
+            for point in route.points:
+                points.append({
+                    'latitude': point.latitude,
+                    'longitude': point.longitude,
+                    'elevation': point.elevation,
+                    'time': point.time.isoformat() if point.time else None
+                })
+    # Fallback : waypoints isolés
+    if not points:
+        for point in gpx.waypoints:
+            points.append({
+                'latitude': point.latitude,
+                'longitude': point.longitude,
+                'elevation': point.elevation,
+                'time': point.time.isoformat() if point.time else None
+            })
     return points
 
 
@@ -421,7 +441,12 @@ def upload_gpx():
 
     try:
         # Lire le contenu
-        file_content = file.read().decode('utf-8')
+        raw = file.read()
+        # Gérer BOM UTF-8 et encodages variés
+        try:
+            file_content = raw.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            file_content = raw.decode('latin-1')
 
         # Sauvegarder le fichier original
         upload_dir = app.config['UPLOAD_FOLDER']
