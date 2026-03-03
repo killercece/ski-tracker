@@ -79,8 +79,27 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * asin(sqrt(a))
 
 
+def repair_gpx(content):
+    """Répare un fichier GPX tronqué en ajoutant les balises fermantes manquantes."""
+    content = content.rstrip()
+    closing_tags = ['</trkpt>', '</trkseg>', '</trk>', '</rte>', '</gpx>']
+    for tag in closing_tags:
+        if tag in content and not content.endswith(tag.replace('</', '</').replace('>', '')):
+            pass
+    # Vérifier et ajouter les balises fermantes manquantes
+    if '</gpx>' not in content:
+        if '</trkseg>' not in content.split('</trkpt>')[-1] if '</trkpt>' in content else True:
+            content += '\n    </trkseg>'
+        if '</trk>' not in content.split('</trkseg>')[-1] if '</trkseg>' in content else True:
+            content += '\n  </trk>'
+        content += '\n</gpx>'
+        logger.info("Fichier GPX tronqué réparé (balises fermantes ajoutées)")
+    return content
+
+
 def parse_gpx(file_content):
     """Parse un fichier GPX et retourne la liste des points (tracks, routes, waypoints)."""
+    file_content = repair_gpx(file_content)
     gpx = gpxpy.parse(file_content)
     points = []
     # Points de tracks (cas principal)
