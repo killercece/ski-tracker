@@ -4,7 +4,7 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.4.4'
+__version__ = '1.4.5'
 
 import os
 import logging
@@ -130,6 +130,16 @@ def init_db():
             min_lon REAL, max_lon REAL,
             fetched_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS reference_pistes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            difficulty TEXT NOT NULL,
+            resort TEXT,
+            osm_id INTEGER,
+            geometry TEXT,
+            bbox_min_lat REAL, bbox_max_lat REAL,
+            bbox_min_lon REAL, bbox_max_lon REAL
+        );
     """)
     # Migration : ajouter user_id si manquant
     cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
@@ -154,6 +164,10 @@ def init_db():
         conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
         conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.3')")
         logger.info("Migration v1.4.3 : cache et matchs purgés (one-shot)")
+    if '1.4.5' not in applied:
+        conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.5')")
+        logger.info("Migration v1.4.5 : matchs purgés pour reference_pistes")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
@@ -801,9 +815,15 @@ def ensure_pistes_cached(session_id):
     """, (min_lat, max_lat, min_lon, max_lon, f'-{PISTE_CACHE_TTL_DAYS} days')).fetchone()
 
     if existing:
+        # Vérifier que reference_pistes est rempli, sinon reconstruire
+        ref_count = db.execute("SELECT COUNT(*) as cnt FROM reference_pistes").fetchone()['cnt']
+        osm_count = db.execute("SELECT COUNT(*) as cnt FROM osm_pistes").fetchone()['cnt']
+        if ref_count == 0 and osm_count > 0:
+            build_reference_pistes()
         return
 
     fetch_osm_pistes(min_lat, max_lat, min_lon, max_lon)
+    build_reference_pistes()
 
 
 def point_to_segment_distance(lat, lon, lat1, lon1, lat2, lon2):
@@ -866,10 +886,10 @@ def match_track_to_piste(track_id):
     track_min_lon = min(lons) - margin
     track_max_lon = max(lons) + margin
 
-    # Pistes candidates par intersection de bbox
+    # Pistes candidates par intersection de bbox (table de référence propre)
     pistes = db.execute("""
-        SELECT osm_id, name, difficulty, geometry
-        FROM osm_pistes
+        SELECT id, name, difficulty, geometry
+        FROM reference_pistes
         WHERE bbox_max_lat >= ? AND bbox_min_lat <= ?
         AND bbox_max_lon >= ? AND bbox_min_lon <= ?
     """, (track_min_lat, track_max_lat, track_min_lon, track_max_lon)).fetchall()
@@ -901,45 +921,15 @@ def match_track_to_piste(track_id):
         """, (track_id,))
         return
 
-    # Trier par score desc, puis préférer les pistes nommées à score égal (±5%)
-    scored.sort(key=lambda x: (round(x[1], 1), 1 if x[0]['name'] else 0), reverse=True)
+    # Trier par score desc (toutes les pistes de référence ont un nom)
+    scored.sort(key=lambda x: x[1], reverse=True)
     best_piste, best_score = scored[0]
 
-    # Si la meilleure est sans nom, chercher une nommée avec un score proche (≥90% du best)
-    if not best_piste['name']:
-        for piste, score in scored[1:]:
-            if score < best_score * 0.90:
-                break
-            if piste['name']:
-                best_piste = piste
-                best_score = score
-                break
-
-    # Résoudre le nom final (NULL si la piste OSM n'a pas de nom)
-    piste_name = best_piste['name'] or None
     db.execute("""
         UPDATE tracks SET piste_osm_id = ?, piste_name = ?, piste_difficulty = ?, match_confidence = ?
         WHERE id = ?
-    """, (best_piste['osm_id'], piste_name, best_piste['difficulty'],
+    """, (best_piste['id'], best_piste['name'], best_piste['difficulty'],
           round(best_score, 2), track_id))
-
-
-def _load_reference_pistes():
-    """Charge le fichier de référence des pistes officielles des 3 Vallées."""
-    ref_path = os.path.join(app.static_folder, 'pistes_3v_reference.json')
-    if not os.path.exists(ref_path):
-        return []
-    try:
-        with open(ref_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        all_pistes = []
-        for resort in data.get('resorts', {}).values():
-            for p in resort.get('pistes', []):
-                all_pistes.append(p)
-        return all_pistes
-    except Exception as e:
-        logger.warning("Impossible de charger le fichier de référence pistes : %s", e)
-        return []
 
 
 def _normalize_piste_name(name):
@@ -977,62 +967,62 @@ def _normalize_piste_name(name):
 
 
 def _build_reference_lookup():
-    """Construit un dictionnaire normalized_name → {name, difficulty} depuis le fichier référence."""
-    ref_pistes = _load_reference_pistes()
+    """Construit un dictionnaire normalized_name → {name, difficulty, resort} depuis le fichier référence."""
+    ref_path = os.path.join(app.static_folder, 'pistes_3v_reference.json')
+    if not os.path.exists(ref_path):
+        return {}
+    try:
+        with open(ref_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.warning("Impossible de charger le fichier de référence pistes : %s", e)
+        return {}
     lookup = {}
-    for p in ref_pistes:
-        key = _normalize_piste_name(p['name'])
-        if key:
-            lookup[key] = {'name': p['name'], 'difficulty': p['difficulty']}
+    for resort_key, resort_data in data.get('resorts', {}).items():
+        resort_label = resort_data.get('label', resort_key)
+        for p in resort_data.get('pistes', []):
+            key = _normalize_piste_name(p['name'])
+            if key:
+                lookup[key] = {'name': p['name'], 'difficulty': p['difficulty'], 'resort': resort_label}
     return lookup
 
 
-def _lookup_reference(norm, lookup):
-    """Cherche un nom normalisé dans le lookup (exact match après normalisation)."""
-    if not norm:
-        return None
-    return lookup.get(norm)
-
-
-def _correct_from_reference(session_id):
-    """Corrige les pistes matchées via le fichier de référence officiel.
-
-    - Piste trouvée dans la référence → difficulté corrigée
-    - Piste NON trouvée → nom effacé (seule la référence officielle fait foi)
-    """
+def build_reference_pistes():
+    """Construit la table reference_pistes en croisant noms officiels et géométries OSM."""
     db = get_db()
     lookup = _build_reference_lookup()
     if not lookup:
         return
 
-    matched = db.execute("""
-        SELECT t.id, t.piste_name, t.piste_difficulty
-        FROM tracks t
-        WHERE t.session_id = ? AND t.segment_type = 'descent'
-        AND t.piste_osm_id IS NOT NULL AND t.piste_name IS NOT NULL
-    """, (session_id,)).fetchall()
+    # Vider et reconstruire (idempotent)
+    db.execute("DELETE FROM reference_pistes")
 
-    corrected = 0
-    cleared = 0
-    for track in matched:
-        norm = _normalize_piste_name(track['piste_name'])
-        ref = _lookup_reference(norm, lookup)
+    # Pour chaque piste OSM nommée, chercher dans la référence
+    osm_pistes = db.execute("""
+        SELECT osm_id, name, difficulty, geometry,
+               bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon
+        FROM osm_pistes WHERE name IS NOT NULL AND name != ''
+    """).fetchall()
+
+    inserted = 0
+    matched_names = set()
+    for piste in osm_pistes:
+        norm = _normalize_piste_name(piste['name'])
+        ref = lookup.get(norm)
         if ref:
-            # Piste officielle → corriger la difficulté si besoin
-            if track['piste_difficulty'] != ref['difficulty']:
-                db.execute("UPDATE tracks SET piste_difficulty = ? WHERE id = ?",
-                           (ref['difficulty'], track['id']))
-                corrected += 1
-        else:
-            # Nom OSM non vérifié → effacer le nom
-            db.execute("UPDATE tracks SET piste_name = NULL WHERE id = ?",
-                       (track['id'],))
-            cleared += 1
+            db.execute("""INSERT INTO reference_pistes
+                (name, difficulty, resort, osm_id, geometry,
+                 bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (ref['name'], ref['difficulty'], ref['resort'], piste['osm_id'],
+                 piste['geometry'], piste['bbox_min_lat'], piste['bbox_max_lat'],
+                 piste['bbox_min_lon'], piste['bbox_max_lon']))
+            inserted += 1
+            matched_names.add(ref['name'])
 
-    if corrected or cleared:
-        db.commit()
-        logger.info("Référence officielle (session %d) : %d difficultés corrigées, %d noms non-officiels effacés",
-                    session_id, corrected, cleared)
+    db.commit()
+    logger.info("Reference pistes : %d segments OSM liés à %d pistes officielles",
+                inserted, len(matched_names))
 
 
 def match_session_pistes(session_id):
@@ -1049,9 +1039,6 @@ def match_session_pistes(session_id):
         match_track_to_piste(descent['id'])
 
     db.commit()
-
-    # Correction des difficultés depuis la référence officielle
-    _correct_from_reference(session_id)
 
     logger.info("Matching pistes terminé pour session %d : %d descentes", session_id, len(descents))
 
@@ -1461,15 +1448,15 @@ def api_session_pistes(session_id):
 
         margin = 0.01
         pistes = db.execute("""
-            SELECT osm_id, name, difficulty, geometry
-            FROM osm_pistes
+            SELECT id, name, difficulty, geometry
+            FROM reference_pistes
             WHERE bbox_max_lat >= ? AND bbox_min_lat <= ?
             AND bbox_max_lon >= ? AND bbox_min_lon <= ?
         """, (bbox['min_lat'] - margin, bbox['max_lat'] + margin,
               bbox['min_lon'] - margin, bbox['max_lon'] + margin)).fetchall()
 
         return jsonify([{
-            'osm_id': p['osm_id'],
+            'id': p['id'],
             'name': p['name'],
             'difficulty': p['difficulty'],
             'geometry': json.loads(p['geometry'])
