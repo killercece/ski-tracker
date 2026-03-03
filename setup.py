@@ -27,10 +27,18 @@ def setup():
     cursor = conn.cursor()
 
     cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             date TEXT NOT NULL,
+            user_id INTEGER REFERENCES users(id),
             total_distance REAL DEFAULT 0,
             total_elevation_gain REAL DEFAULT 0,
             total_elevation_loss REAL DEFAULT 0,
@@ -70,7 +78,14 @@ def setup():
         CREATE INDEX IF NOT EXISTS idx_tracks_session ON tracks(session_id);
         CREATE INDEX IF NOT EXISTS idx_points_track ON track_points(track_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_date ON sessions(date);
+        CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
     """)
+
+    # Migration : ajouter user_id si manquant (installations existantes)
+    cols = [row[1] for row in cursor.execute("PRAGMA table_info(sessions)").fetchall()]
+    if 'user_id' not in cols:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN user_id INTEGER REFERENCES users(id)")
+        logger.info("Migration : colonne user_id ajoutée à la table sessions")
 
     conn.commit()
     conn.close()

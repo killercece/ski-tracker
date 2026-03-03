@@ -4,17 +4,19 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.0.0'
+__version__ = '1.1.0'
 
 import os
 import logging
 import sqlite3
 from datetime import datetime
+from functools import wraps
 from math import radians, cos, sin, asin, sqrt
 from pathlib import Path
 
 import gpxpy
-from flask import Flask, g, request, jsonify, render_template
+from flask import Flask, g, request, jsonify, render_template, session, redirect, url_for
+from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -59,10 +61,111 @@ def close_db(e=None):
 app.teardown_appcontext(close_db)
 
 
+def login_required(f):
+    """Décorateur pour protéger les routes nécessitant une authentification."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            if request.is_json or request.path.startswith('/api/'):
+                return jsonify({'error': 'Authentification requise'}), 401
+            return redirect(url_for('login_page'))
+        return f(*args, **kwargs)
+    return decorated
+
+
 @app.context_processor
 def inject_globals():
     """Injecte les variables globales dans tous les templates."""
-    return {'version': __version__}
+    user = None
+    if 'user_id' in session:
+        db = get_db()
+        user = db.execute("SELECT id, username FROM users WHERE id = ?", (session['user_id'],)).fetchone()
+        if user:
+            user = dict(user)
+    return {'version': __version__, 'user': user}
+
+# ---------------------------------------------------------------------------
+# Routes — Authentification
+# ---------------------------------------------------------------------------
+
+
+@app.route('/login')
+def login_page():
+    """Page de connexion."""
+    if 'user_id' in session:
+        return redirect(url_for('index'))
+    return render_template('login.html')
+
+
+@app.route('/register')
+def register_page():
+    """Page d'inscription."""
+    if 'user_id' in session:
+        return redirect(url_for('index'))
+    return render_template('register.html')
+
+
+@app.route('/api/register', methods=['POST'])
+def api_register():
+    """Inscription d'un nouvel utilisateur."""
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Données manquantes'}), 400
+
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+
+    if not username or len(username) < 3:
+        return jsonify({'error': 'Le nom d\'utilisateur doit faire au moins 3 caractères'}), 400
+    if len(password) < 6:
+        return jsonify({'error': 'Le mot de passe doit faire au moins 6 caractères'}), 400
+
+    db = get_db()
+    existing = db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    if existing:
+        return jsonify({'error': 'Ce nom d\'utilisateur est déjà pris'}), 409
+
+    password_hash = generate_password_hash(password)
+    cursor = db.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, password_hash))
+    db.commit()
+
+    session['user_id'] = cursor.lastrowid
+    logger.info("Nouvel utilisateur inscrit : %s (id=%d)", username, cursor.lastrowid)
+
+    return jsonify({'message': 'Inscription réussie', 'username': username}), 201
+
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    """Connexion d'un utilisateur."""
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Données manquantes'}), 400
+
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+
+    if not username or not password:
+        return jsonify({'error': 'Nom d\'utilisateur et mot de passe requis'}), 400
+
+    db = get_db()
+    user = db.execute("SELECT id, username, password_hash FROM users WHERE username = ?", (username,)).fetchone()
+
+    if not user or not check_password_hash(user['password_hash'], password):
+        return jsonify({'error': 'Identifiants incorrects'}), 401
+
+    session['user_id'] = user['id']
+    logger.info("Connexion : %s (id=%d)", username, user['id'])
+
+    return jsonify({'message': 'Connexion réussie', 'username': user['username']})
+
+
+@app.route('/api/logout', methods=['POST'])
+def api_logout():
+    """Déconnexion."""
+    session.clear()
+    return jsonify({'message': 'Déconnexion réussie'})
+
 
 # ---------------------------------------------------------------------------
 # Utilitaires GPS
@@ -359,14 +462,14 @@ def compute_session_stats(segments):
     return stats
 
 
-def save_session(db, name, date_str, stats, segments):
+def save_session(db, name, date_str, stats, segments, user_id):
     """Sauvegarde une session complète en BDD (session + tracks + points)."""
     cursor = db.execute(
         """INSERT INTO sessions
-           (name, date, total_distance, total_elevation_gain, total_elevation_loss,
+           (name, date, user_id, total_distance, total_elevation_gain, total_elevation_loss,
             max_speed, avg_speed, num_descents, duration_seconds)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (name, date_str,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (name, date_str, user_id,
          stats['total_distance'], stats['total_elevation_gain'],
          stats['total_elevation_loss'], stats['max_speed'],
          stats['avg_speed'], stats['num_descents'],
@@ -410,21 +513,23 @@ def save_session(db, name, date_str, stats, segments):
 
 
 @app.route('/')
+@login_required
 def index():
     """Page d'accueil — dashboard avec stats globales."""
     return render_template('index.html')
 
 
 @app.route('/session/<int:session_id>')
+@login_required
 def session_detail(session_id):
     """Page de détail d'une session (carte + stats)."""
     db = get_db()
-    session = db.execute(
-        "SELECT * FROM sessions WHERE id = ?", (session_id,)
+    sess = db.execute(
+        "SELECT * FROM sessions WHERE id = ? AND user_id = ?", (session_id, session['user_id'])
     ).fetchone()
-    if not session:
+    if not sess:
         return render_template('index.html'), 404
-    return render_template('session.html', session=dict(session))
+    return render_template('session.html', session=dict(sess))
 
 # ---------------------------------------------------------------------------
 # Routes — API Health
@@ -445,6 +550,7 @@ def health():
 
 
 @app.route('/api/upload', methods=['POST'])
+@login_required
 def upload_gpx():
     """Upload et traitement d'un fichier GPX."""
     if 'file' not in request.files:
@@ -502,7 +608,7 @@ def upload_gpx():
 
         # Sauvegarde en BDD
         db = get_db()
-        session_id = save_session(db, session_name, session_date, stats, segments)
+        session_id = save_session(db, session_name, session_date, stats, segments, session['user_id'])
         logger.info("Session créée : id=%d, name=%s, %d segments",
                      session_id, session_name, len(segments))
 
@@ -527,15 +633,17 @@ def upload_gpx():
 
 
 @app.route('/api/sessions')
+@login_required
 def api_sessions():
-    """Liste toutes les sessions avec leurs stats résumées."""
+    """Liste les sessions de l'utilisateur connecté."""
     try:
         db = get_db()
         sessions = db.execute(
             """SELECT id, name, date, total_distance, total_elevation_gain,
                       total_elevation_loss, max_speed, avg_speed, num_descents,
                       duration_seconds, created_at
-               FROM sessions ORDER BY date DESC"""
+               FROM sessions WHERE user_id = ? ORDER BY date DESC""",
+            (session['user_id'],)
         ).fetchall()
 
         return jsonify([dict(s) for s in sessions])
@@ -546,15 +654,16 @@ def api_sessions():
 
 
 @app.route('/api/sessions/<int:session_id>')
+@login_required
 def api_session_detail(session_id):
     """Détail d'une session avec ses stats et segments."""
     try:
         db = get_db()
-        session = db.execute(
-            "SELECT * FROM sessions WHERE id = ?", (session_id,)
+        sess = db.execute(
+            "SELECT * FROM sessions WHERE id = ? AND user_id = ?", (session_id, session['user_id'])
         ).fetchone()
 
-        if not session:
+        if not sess:
             return jsonify({'error': 'Session non trouvée'}), 404
 
         tracks = db.execute(
@@ -565,7 +674,7 @@ def api_session_detail(session_id):
         ).fetchall()
 
         return jsonify({
-            'session': dict(session),
+            'session': dict(sess),
             'tracks': [dict(t) for t in tracks]
         })
 
@@ -575,18 +684,19 @@ def api_session_detail(session_id):
 
 
 @app.route('/api/sessions/<int:session_id>', methods=['DELETE'])
+@login_required
 def api_delete_session(session_id):
     """Supprime une session et toutes ses données associées."""
     try:
         db = get_db()
-        session = db.execute(
-            "SELECT id FROM sessions WHERE id = ?", (session_id,)
+        sess = db.execute(
+            "SELECT id FROM sessions WHERE id = ? AND user_id = ?", (session_id, session['user_id'])
         ).fetchone()
 
-        if not session:
+        if not sess:
             return jsonify({'error': 'Session non trouvée'}), 404
 
-        db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        db.execute("DELETE FROM sessions WHERE id = ? AND user_id = ?", (session_id, session['user_id']))
         db.commit()
         logger.info("Session supprimée : id=%d", session_id)
 
@@ -598,15 +708,16 @@ def api_delete_session(session_id):
 
 
 @app.route('/api/sessions/<int:session_id>/tracks')
+@login_required
 def api_session_tracks(session_id):
     """Retourne les traces GPS d'une session pour affichage Leaflet."""
     try:
         db = get_db()
-        session = db.execute(
-            "SELECT id FROM sessions WHERE id = ?", (session_id,)
+        sess = db.execute(
+            "SELECT id FROM sessions WHERE id = ? AND user_id = ?", (session_id, session['user_id'])
         ).fetchone()
 
-        if not session:
+        if not sess:
             return jsonify({'error': 'Session non trouvée'}), 404
 
         tracks = db.execute(
@@ -639,8 +750,9 @@ def api_session_tracks(session_id):
 
 
 @app.route('/api/stats')
+@login_required
 def api_global_stats():
-    """Statistiques globales agrégées sur toutes les sessions."""
+    """Statistiques globales agrégées sur les sessions de l'utilisateur."""
     try:
         db = get_db()
         stats = db.execute(
@@ -652,7 +764,8 @@ def api_global_stats():
                 COALESCE(MAX(max_speed), 0) as max_speed,
                 COALESCE(SUM(num_descents), 0) as total_descents,
                 COALESCE(SUM(duration_seconds), 0) as total_duration
-               FROM sessions"""
+               FROM sessions WHERE user_id = ?""",
+            (session['user_id'],)
         ).fetchone()
 
         result = dict(stats)
@@ -664,7 +777,8 @@ def api_global_stats():
                      THEN SUM(avg_speed * duration_seconds) / SUM(duration_seconds)
                      ELSE 0 END as avg_speed
                FROM sessions
-               WHERE duration_seconds > 0"""
+               WHERE duration_seconds > 0 AND user_id = ?""",
+            (session['user_id'],)
         ).fetchone()
         result['avg_speed'] = round(avg_row['avg_speed'], 2) if avg_row else 0
 
