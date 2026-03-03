@@ -96,16 +96,16 @@
 }
 
 /* Table row hover */
-#descents-table tr {
+#day-descents-table tr {
     cursor: pointer;
     transition: background-color 0.15s;
 }
 
-#descents-table tr:hover {
+#day-descents-table tr:hover {
     background-color: rgba(2, 132, 199, 0.05);
 }
 
-.dark #descents-table tr:hover {
+.dark #day-descents-table tr:hover {
     background-color: rgba(2, 132, 199, 0.1);
 }
 

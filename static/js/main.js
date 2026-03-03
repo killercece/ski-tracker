@@ -115,6 +115,47 @@ function toggleSidebar() {
 }
 
 // ---------------------------------------------------------------------------
+// Routeur client-side (SPA)
+// ---------------------------------------------------------------------------
+
+function navigateTo(path) {
+    history.pushState(null, '', path);
+    routeChanged();
+}
+
+function navigateToDate(dateStr) {
+    if (dateStr) navigateTo('/day/' + dateStr);
+}
+
+function routeChanged() {
+    var path = window.location.pathname;
+    var match = path.match(/^\/day\/(\d{4}-\d{2}-\d{2})$/);
+
+    if (match) {
+        showDayView(match[1]);
+    } else {
+        showDashboardView();
+    }
+}
+
+function showDashboardView() {
+    document.getElementById('view-dashboard').classList.remove('hidden');
+    document.getElementById('view-day').classList.add('hidden');
+    loadGlobalStats();
+    loadDaysList();
+}
+
+function showDayView(dateStr) {
+    document.getElementById('view-dashboard').classList.add('hidden');
+    document.getElementById('view-day').classList.remove('hidden');
+    document.getElementById('date-picker').value = dateStr;
+    setText('day-title', formatDate(dateStr));
+    loadDayData(dateStr);
+}
+
+window.addEventListener('popstate', routeChanged);
+
+// ---------------------------------------------------------------------------
 // Dashboard : Stats globales
 // ---------------------------------------------------------------------------
 
@@ -130,32 +171,51 @@ async function loadGlobalStats() {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard : Navigation par date
+// Dashboard : Liste des journees
+// ---------------------------------------------------------------------------
+
+var sessionsCache = null;
+
+async function loadDaysList() {
+    try {
+        sessionsCache = await api('/api/sessions');
+        var container = document.getElementById('days-list');
+        var emptyEl = document.getElementById('days-empty');
+        if (!container) return;
+
+        if (!sessionsCache || sessionsCache.length === 0) {
+            container.innerHTML = '';
+            if (emptyEl) emptyEl.classList.remove('hidden');
+            return;
+        }
+
+        if (emptyEl) emptyEl.classList.add('hidden');
+
+        container.innerHTML = sessionsCache.map(function(s) {
+            return '<a href="/day/' + s.date + '" onclick="navigateTo(\'/day/' + s.date + '\'); return false;" ' +
+                'class="session-card block rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 hover:border-primary-500 transition-all">' +
+                '<div class="flex items-center justify-between mb-3">' +
+                    '<h3 class="font-semibold">' + formatDate(s.date) + '</h3>' +
+                    '<svg class="w-4 h-4 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5"/></svg>' +
+                '</div>' +
+                '<div class="grid grid-cols-3 gap-3 text-sm">' +
+                    '<div><span class="text-xs text-zinc-500 dark:text-zinc-400 block">Distance</span><span class="font-semibold tabular-nums">' + fmt1(s.total_distance) + ' km</span></div>' +
+                    '<div><span class="text-xs text-zinc-500 dark:text-zinc-400 block">Denivele</span><span class="font-semibold tabular-nums">' + fmt0(s.total_elevation_gain) + ' m</span></div>' +
+                    '<div><span class="text-xs text-zinc-500 dark:text-zinc-400 block">Descentes</span><span class="font-semibold tabular-nums">' + (s.num_descents || 0) + '</span></div>' +
+                '</div>' +
+            '</a>';
+        }).join('');
+    } catch (e) {}
+}
+
+// ---------------------------------------------------------------------------
+// Vue jour : Navigation par date
 // ---------------------------------------------------------------------------
 
 var availableDates = [];
 var currentDateIndex = -1;
 var dayMap = null;
 var dayTrackLayers = {};
-var sessionsCache = null;
-
-async function loadAvailableDates() {
-    try {
-        var dates = await api('/api/dates');
-        availableDates = dates;
-
-        if (dates.length > 0) {
-            document.getElementById('date-picker').value = dates[0];
-            currentDateIndex = 0;
-            sessionsCache = null;
-            loadDayData(dates[0]);
-        } else {
-            document.getElementById('no-day-selected').classList.remove('hidden');
-            document.getElementById('day-content').classList.add('hidden');
-        }
-        updateNavButtons();
-    } catch (e) {}
-}
 
 function updateNavButtons() {
     var prevBtn = document.getElementById('prev-day-btn');
@@ -167,24 +227,24 @@ function updateNavButtons() {
 function prevDay() {
     if (currentDateIndex < availableDates.length - 1) {
         currentDateIndex++;
-        var date = availableDates[currentDateIndex];
-        document.getElementById('date-picker').value = date;
-        loadDayData(date);
-        updateNavButtons();
+        navigateTo('/day/' + availableDates[currentDateIndex]);
     }
 }
 
 function nextDay() {
     if (currentDateIndex > 0) {
         currentDateIndex--;
-        var date = availableDates[currentDateIndex];
-        document.getElementById('date-picker').value = date;
-        loadDayData(date);
-        updateNavButtons();
+        navigateTo('/day/' + availableDates[currentDateIndex]);
     }
 }
 
 async function loadDayData(dateStr) {
+    if (availableDates.length === 0) {
+        try {
+            availableDates = await api('/api/dates');
+        } catch (e) { availableDates = []; }
+    }
+
     var idx = availableDates.indexOf(dateStr);
     if (idx >= 0) currentDateIndex = idx;
     updateNavButtons();
@@ -196,13 +256,10 @@ async function loadDayData(dateStr) {
         var sess = sessionsCache.find(function(s) { return s.date === dateStr; });
 
         if (!sess) {
-            document.getElementById('no-day-selected').classList.remove('hidden');
-            document.getElementById('day-content').classList.add('hidden');
+            showToast('Aucune session pour cette date', 'warning');
+            navigateTo('/');
             return;
         }
-
-        document.getElementById('no-day-selected').classList.add('hidden');
-        document.getElementById('day-content').classList.remove('hidden');
 
         var tracksData = await api('/api/sessions/' + sess.id + '/tracks');
 
@@ -225,7 +282,7 @@ async function loadDayData(dateStr) {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard : Carte du jour
+// Vue jour : Carte Leaflet
 // ---------------------------------------------------------------------------
 
 function renderDayMap(tracks) {
@@ -310,7 +367,7 @@ function renderDayMap(tracks) {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard : Tableau des descentes du jour
+// Vue jour : Tableau des descentes
 // ---------------------------------------------------------------------------
 
 function renderDayDescentsTable(tracks) {
@@ -350,7 +407,7 @@ function zoomToDayTrack(trackId) {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard : Upload GPX
+// Upload GPX
 // ---------------------------------------------------------------------------
 
 var selectedFile = null;
@@ -442,8 +499,9 @@ async function uploadGPX() {
             showToast(msg);
             clearFile();
             sessionsCache = null;
+            availableDates = [];
             loadGlobalStats();
-            loadAvailableDates();
+            loadDaysList();
         } else {
             var err = 'Erreur lors de l\'import';
             try {

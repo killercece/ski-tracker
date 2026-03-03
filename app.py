@@ -4,7 +4,7 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.2.0'
+__version__ = '1.3.0'
 
 import os
 import logging
@@ -539,6 +539,12 @@ def index():
     """Page d'accueil — dashboard avec stats globales."""
     return render_template('index.html')
 
+
+@app.route('/day/<date>')
+@login_required
+def day_detail(date):
+    """Page detail d'une journee de ski (rendue cote client)."""
+    return render_template('index.html')
 
 
 # ---------------------------------------------------------------------------
