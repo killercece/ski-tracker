@@ -540,17 +540,6 @@ def index():
     return render_template('index.html')
 
 
-@app.route('/session/<int:session_id>')
-@login_required
-def session_detail(session_id):
-    """Page de détail d'une session (carte + stats)."""
-    db = get_db()
-    sess = db.execute(
-        "SELECT * FROM sessions WHERE id = ? AND user_id = ?", (session_id, session['user_id'])
-    ).fetchone()
-    if not sess:
-        return render_template('index.html'), 404
-    return render_template('session.html', session=dict(sess))
 
 # ---------------------------------------------------------------------------
 # Routes — API Health
