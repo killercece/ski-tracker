@@ -179,11 +179,11 @@ def init_db():
         conn.execute("UPDATE tracks SET piste_name=NULL, piste_difficulty=NULL, piste_osm_id=NULL, match_confidence=NULL WHERE segment_type='lift'")
         conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.9')")
         logger.info("Migration v1.4.9 : matchs remontées purgés pour re-matching")
-    if '1.4.11' not in applied:
+    if '1.4.11b' not in applied:
         # Re-segmenter toutes les sessions (meilleure détection des remontées)
         _resegment_all_sessions(conn)
-        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.11')")
-        logger.info("Migration v1.4.11 : re-segmentation terminée")
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.11b')")
+        logger.info("Migration v1.4.11b : re-segmentation terminée")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
@@ -406,18 +406,21 @@ def compute_point_metrics(points):
 
 def classify_point(speed, elev_delta):
     """Classifie un point individuel en phase."""
-    # Montée même lente = remontée mécanique (télésièges enregistrent mal le GPS)
-    if elev_delta > 0.3 and speed < 15.0:
-        return 'lift'
+    # Immobile = pause
     if speed < 2.0 and abs(elev_delta) < 0.3:
         return 'pause'
-    if elev_delta < 0 and speed > 5.0:
-        return 'descent'
-    if speed > 15.0:
-        return 'descent'
-    if elev_delta > 0:
+    # Monte = remontée mécanique (quelle que soit la vitesse)
+    if elev_delta > 0.3:
         return 'lift'
-    return 'pause'
+    # Descend = descente
+    if elev_delta < -0.3:
+        return 'descent'
+    # Plat : départager par vitesse
+    if speed > 10.0:
+        return 'descent'
+    if speed < 2.0:
+        return 'pause'
+    return 'lift'
 
 
 def detect_segments(points):
@@ -540,12 +543,20 @@ def _merge_short_segments(segments, min_points=3):
 
 
 def _validate_segments(segments):
-    """Valide les segments selon les seuils d'altitude."""
+    """Valide et corrige les segments selon l'élévation réelle."""
     for seg in segments:
-        elev = abs(seg['elevation_change'])
-        if seg['type'] == 'descent' and elev < 50:
+        elev = seg['elevation_change']
+        abs_elev = abs(elev)
+        # Corriger les descentes qui montent → ce sont des lifts
+        if seg['type'] == 'descent' and elev > 20:
+            seg['type'] = 'lift'
+        # Corriger les lifts qui descendent → ce sont des descentes
+        elif seg['type'] == 'lift' and elev < -20:
+            seg['type'] = 'descent'
+        # Segments trop petits → pause
+        if seg['type'] == 'descent' and abs_elev < 50:
             seg['type'] = 'pause'
-        elif seg['type'] == 'lift' and elev < 20:
+        elif seg['type'] == 'lift' and abs_elev < 20:
             seg['type'] = 'pause'
     return segments
 
