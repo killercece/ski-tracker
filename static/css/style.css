@@ -5,7 +5,7 @@
     transform: translateX(0);
 }
 
-/* Carte Leaflet */
+/* Carte MapLibre */
 .map-container {
     height: 500px;
     width: 100%;
@@ -18,31 +18,42 @@
     }
 }
 
-/* Leaflet overrides pour le theme sombre */
-.dark .leaflet-control-zoom a,
-.dark .leaflet-control-layers {
+/* MapLibre overrides pour le theme sombre */
+.dark .maplibregl-ctrl-group {
     background-color: #18181b;
-    color: #fafafa;
     border-color: #27272a;
 }
 
-.dark .leaflet-control-zoom a:hover {
+.dark .maplibregl-ctrl-group button {
+    background-color: #18181b;
+    border-color: #27272a;
+}
+
+.dark .maplibregl-ctrl-group button:hover {
     background-color: #27272a;
 }
 
-.dark .leaflet-control-layers-list {
-    background-color: #18181b;
-    color: #fafafa;
+.dark .maplibregl-ctrl-group button span {
+    filter: invert(1);
 }
 
-.dark .leaflet-popup-content-wrapper {
+.dark .maplibregl-popup-content {
     background-color: #18181b;
     color: #fafafa;
     border: 1px solid #27272a;
 }
 
-.dark .leaflet-popup-tip {
-    background-color: #18181b;
+.dark .maplibregl-popup-tip {
+    border-top-color: #18181b;
+}
+
+.dark .maplibregl-popup-close-button {
+    color: #a1a1aa;
+}
+
+.dark .maplibregl-popup-close-button:hover {
+    color: #fafafa;
+    background-color: #27272a;
 }
 
 /* Drop zone animation */
@@ -194,10 +205,9 @@ main {
     transition: all 0.2s ease-out;
 }
 
-/* Numeros sur la carte - Leaflet override */
-.leaflet-marker-icon {
-    background: none !important;
-    border: none !important;
+/* Marqueurs MapLibre */
+.maplibregl-marker {
+    cursor: pointer;
 }
 
 /* Canvas profil */

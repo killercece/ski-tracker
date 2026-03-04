@@ -4,7 +4,7 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.5.0'
+__version__ = '1.6.0'
 
 import os
 import logging

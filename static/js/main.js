@@ -322,8 +322,13 @@ async function loadDayData(dateStr) {
 }
 
 // ---------------------------------------------------------------------------
-// Vue jour : Carte Leaflet
+// Vue jour : Carte MapLibre GL JS (terrain 3D)
 // ---------------------------------------------------------------------------
+
+var _mapMarkers = [];
+var _mapPopups = [];
+var _descentVisible = true;
+var _liftVisible = true;
 
 function renderDayMap(tracks, sessionId) {
     var mapEl = document.getElementById('day-map');
@@ -331,86 +336,189 @@ function renderDayMap(tracks, sessionId) {
 
     if (dayMap) { dayMap.remove(); dayMap = null; }
     dayTrackLayers = {};
+    _mapMarkers.forEach(function(m) { m.remove(); });
+    _mapMarkers = [];
+    _mapPopups.forEach(function(p) { p.remove(); });
+    _mapPopups = [];
 
-    dayMap = L.map('day-map', { zoomControl: true, scrollWheelZoom: true });
-
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap', maxZoom: 18
-    }).addTo(dayMap);
-
-    var allBounds = [];
-    var overlays = {
-        'Descentes': L.layerGroup(),
-        'Remontees': L.layerGroup()
-    };
-
-    // Utiliser la timeline groupee (meme logique que le tableau)
     var timeline = buildTimeline(tracks);
+    if (timeline.length === 0) return;
 
+    // Calculer les bounds pour le centre initial
+    var minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
     timeline.forEach(function(item) {
-        if (!item.points || item.points.length < 2) return;
-
-        var isLift = item.type === 'lift';
-        var latlngs = item.points.map(function(p) { return [p.latitude, p.longitude]; });
-
-        // Style différencié
-        var polylineStyle;
-        if (isLift) {
-            polylineStyle = { color: '#93c5fd', weight: 2, opacity: 0.4, dashArray: '6 8' };
-        } else {
-            polylineStyle = { color: pisteColor(item.piste_difficulty), weight: 4, opacity: 0.85 };
-        }
-
-        var polyline = L.polyline(latlngs, polylineStyle);
-
-        // Popup
-        var popupContent = '<div style="font-family: Inter, sans-serif; font-size: 13px; line-height: 1.5;">';
-        if (isLift) {
-            var liftName = item.piste_name ? item.piste_name : 'Remontee';
-            popupContent += '<strong>' + liftName + ' #' + item.num + '</strong>' +
-                '<br>Duree : ' + formatDuration(item.duration_seconds) +
-                '<br>Denivele : ' + fmt0(Math.abs(item.elevation_change)) + ' m';
-        } else {
-            popupContent += '<strong>Descente #' + item.num + '</strong>';
-            popupContent += '<br>Piste : <strong>' + item.piste_name + '</strong>';
-            if (item.piste_difficulty) popupContent += ' (' + pisteDifficultyLabel(item.piste_difficulty) + ')';
-            popupContent += '<br>Distance : ' + fmt1(item.distance) + ' km' +
-                '<br>Denivele : ' + fmt0(Math.abs(item.elevation_change)) + ' m' +
-                '<br>Duree : ' + formatDuration(item.duration_seconds) +
-                '<br>Vit. moy : ' + fmt1(item.avg_speed) + ' km/h' +
-                '<br>Vit. max : ' + fmt1(item.max_speed) + ' km/h';
-        }
-        popupContent += '</div>';
-        polyline.bindPopup(popupContent);
-
-        // Stocker chaque track_id du groupe pour zoomToTracks
-        item.track_ids.forEach(function(tid) { dayTrackLayers[tid] = polyline; });
-
-        // Ajouter au layer group
-        var layerName = isLift ? 'Remontees' : 'Descentes';
-        overlays[layerName].addTo(dayMap);
-        polyline.addTo(overlays[layerName]);
-
-        // Marqueur numéroté au début du segment
-        var bgColor = isLift ? '#93c5fd' : pisteColor(item.piste_difficulty);
-        var icon = L.divIcon({
-            html: '<div style="width:20px;height:20px;background:' + bgColor + ';border:2px solid white;border-radius:50%;color:#fff;font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,0.3);">' + item.num + '</div>',
-            iconSize: [20, 20], iconAnchor: [10, 10], className: ''
+        if (!item.points) return;
+        item.points.forEach(function(p) {
+            if (p.latitude < minLat) minLat = p.latitude;
+            if (p.latitude > maxLat) maxLat = p.latitude;
+            if (p.longitude < minLon) minLon = p.longitude;
+            if (p.longitude > maxLon) maxLon = p.longitude;
         });
-        L.marker(latlngs[0], { icon: icon }).addTo(dayMap);
+    });
+    var centerLat = (minLat + maxLat) / 2;
+    var centerLon = (minLon + maxLon) / 2;
 
-        latlngs.forEach(function(ll) { allBounds.push(ll); });
+    dayMap = new maplibregl.Map({
+        container: 'day-map',
+        zoom: 13,
+        center: [centerLon, centerLat],
+        pitch: 60,
+        bearing: -20,
+        maxPitch: 85,
+        style: {
+            version: 8,
+            sources: {
+                'osm-tiles': {
+                    type: 'raster',
+                    tiles: ['https://a.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                            'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png'],
+                    tileSize: 256,
+                    attribution: '&copy; OpenStreetMap'
+                },
+                'terrain-source': {
+                    type: 'raster-dem',
+                    url: 'https://demotiles.maplibre.org/terrain-tiles/tiles.json',
+                    tileSize: 256
+                },
+                'hillshade-source': {
+                    type: 'raster-dem',
+                    url: 'https://demotiles.maplibre.org/terrain-tiles/tiles.json',
+                    tileSize: 256
+                }
+            },
+            layers: [
+                { id: 'osm', type: 'raster', source: 'osm-tiles', minzoom: 0, maxzoom: 19 },
+                { id: 'hillshade', type: 'hillshade', source: 'hillshade-source',
+                  paint: { 'hillshade-shadow-color': '#473B24', 'hillshade-illumination-anchor': 'viewport' }
+                }
+            ],
+            terrain: { source: 'terrain-source', exaggeration: 1 },
+            sky: {}
+        }
     });
 
-    Object.keys(overlays).forEach(function(name) {
-        overlays[name].addTo(dayMap);
-    });
+    dayMap.addControl(new maplibregl.NavigationControl({ visualizePitch: true }));
+    dayMap.addControl(new maplibregl.TerrainControl({ source: 'terrain-source', exaggeration: 1 }));
 
-    if (allBounds.length > 0) {
-        dayMap.fitBounds(allBounds, { padding: [30, 30] });
+    dayMap.on('load', function() {
+        // Ajouter les traces
+        timeline.forEach(function(item, idx) {
+            if (!item.points || item.points.length < 2) return;
+
+            var isLift = item.type === 'lift';
+            var coords = item.points.map(function(p) { return [p.longitude, p.latitude]; });
+            var sourceId = 'track-' + idx;
+            var layerId = 'track-line-' + idx;
+            var layerType = isLift ? 'lift' : 'descent';
+
+            dayMap.addSource(sourceId, {
+                type: 'geojson',
+                data: { type: 'Feature', geometry: { type: 'LineString', coordinates: coords },
+                        properties: { type: layerType, num: item.num } }
+            });
+
+            var paint = {};
+            if (isLift) {
+                paint = { 'line-color': '#93c5fd', 'line-width': 2, 'line-opacity': 0.5 };
+                dayMap.addLayer({ id: layerId, type: 'line', source: sourceId,
+                    paint: paint, layout: { 'line-cap': 'round', 'line-join': 'round' },
+                    metadata: { trackType: 'lift' }
+                });
+            } else {
+                paint = { 'line-color': pisteColor(item.piste_difficulty), 'line-width': 4, 'line-opacity': 0.85 };
+                dayMap.addLayer({ id: layerId, type: 'line', source: sourceId,
+                    paint: paint, layout: { 'line-cap': 'round', 'line-join': 'round' },
+                    metadata: { trackType: 'descent' }
+                });
+            }
+
+            // Stocker pour zoomToTracks
+            item.track_ids.forEach(function(tid) {
+                dayTrackLayers[tid] = { bounds: [
+                    [Math.min.apply(null, coords.map(function(c){return c[0]})),
+                     Math.min.apply(null, coords.map(function(c){return c[1]}))],
+                    [Math.max.apply(null, coords.map(function(c){return c[0]})),
+                     Math.max.apply(null, coords.map(function(c){return c[1]}))]
+                ], layerId: layerId, sourceId: sourceId };
+            });
+
+            // Popup au clic
+            var popupContent = '<div style="font-family:Inter,sans-serif;font-size:13px;line-height:1.5;">';
+            if (isLift) {
+                var liftName = item.piste_name || 'Remontee';
+                popupContent += '<strong>' + liftName + ' #' + item.num + '</strong>' +
+                    '<br>Duree : ' + formatDuration(item.duration_seconds) +
+                    '<br>Denivele : ' + fmt0(Math.abs(item.elevation_change)) + ' m';
+            } else {
+                popupContent += '<strong>Descente #' + item.num + '</strong>';
+                popupContent += '<br>Piste : <strong>' + item.piste_name + '</strong>';
+                if (item.piste_difficulty) popupContent += ' (' + pisteDifficultyLabel(item.piste_difficulty) + ')';
+                popupContent += '<br>Distance : ' + fmt1(item.distance) + ' km' +
+                    '<br>Denivele : ' + fmt0(Math.abs(item.elevation_change)) + ' m' +
+                    '<br>Duree : ' + formatDuration(item.duration_seconds) +
+                    '<br>Vit. moy : ' + fmt1(item.avg_speed) + ' km/h' +
+                    '<br>Vit. max : ' + fmt1(item.max_speed) + ' km/h';
+            }
+            popupContent += '</div>';
+
+            dayMap.on('click', layerId, function(e) {
+                new maplibregl.Popup({ closeButton: true, maxWidth: '250px' })
+                    .setLngLat(e.lngLat)
+                    .setHTML(popupContent)
+                    .addTo(dayMap);
+            });
+            dayMap.on('mouseenter', layerId, function() { dayMap.getCanvas().style.cursor = 'pointer'; });
+            dayMap.on('mouseleave', layerId, function() { dayMap.getCanvas().style.cursor = ''; });
+
+            // Marqueur numerote au debut
+            var bgColor = isLift ? '#93c5fd' : pisteColor(item.piste_difficulty);
+            var el = document.createElement('div');
+            el.style.cssText = 'width:22px;height:22px;background:' + bgColor +
+                ';border:2px solid white;border-radius:50%;color:#fff;font-size:10px;font-weight:700;' +
+                'display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,0.4);';
+            el.textContent = item.num;
+            var marker = new maplibregl.Marker({ element: el })
+                .setLngLat(coords[0])
+                .addTo(dayMap);
+            _mapMarkers.push(marker);
+        });
+
+        // Fit bounds
+        dayMap.fitBounds([[minLon, minLat], [maxLon, maxLat]], {
+            padding: { top: 40, bottom: 40, left: 40, right: 40 },
+            pitch: 60, bearing: -20
+        });
+
+        // Boutons toggle overlays
+        _addLayerToggle();
+    });
+}
+
+function _addLayerToggle() {
+    var container = document.createElement('div');
+    container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
+    container.style.cssText = 'padding:6px;font-size:12px;font-family:Inter,sans-serif;';
+
+    function makeBtn(label, type, active) {
+        var btn = document.createElement('button');
+        btn.textContent = label;
+        btn.style.cssText = 'display:block;width:100%;text-align:left;padding:4px 8px;border:none;background:none;cursor:pointer;border-radius:4px;opacity:' + (active ? '1' : '0.4') + ';';
+        btn.onclick = function() {
+            var visible = btn.style.opacity === '1';
+            btn.style.opacity = visible ? '0.4' : '1';
+            dayMap.getStyle().layers.forEach(function(layer) {
+                if (layer.metadata && layer.metadata.trackType === type) {
+                    dayMap.setLayoutProperty(layer.id, 'visibility', visible ? 'none' : 'visible');
+                }
+            });
+        };
+        return btn;
     }
+    container.appendChild(makeBtn('Descentes', 'descent', true));
+    container.appendChild(makeBtn('Remontees', 'lift', true));
 
-    L.control.layers(null, overlays, { collapsed: false }).addTo(dayMap);
+    var ctrl = { onAdd: function() { return container; }, onRemove: function() { container.remove(); } };
+    dayMap.addControl(ctrl, 'top-right');
 }
 
 // ---------------------------------------------------------------------------
@@ -580,19 +688,24 @@ function renderDayDescentsTable(tracks) {
 }
 
 function zoomToTracks(trackIds) {
-    var bounds = [];
+    if (!dayMap) return;
+    var minLon = 180, minLat = 90, maxLon = -180, maxLat = -90;
+    var found = false;
     trackIds.forEach(function(id) {
-        var layer = dayTrackLayers[id];
-        if (layer && dayMap) {
-            var b = layer.getBounds();
-            bounds.push(b.getSouthWest());
-            bounds.push(b.getNorthEast());
+        var info = dayTrackLayers[id];
+        if (info && info.bounds) {
+            found = true;
+            if (info.bounds[0][0] < minLon) minLon = info.bounds[0][0];
+            if (info.bounds[0][1] < minLat) minLat = info.bounds[0][1];
+            if (info.bounds[1][0] > maxLon) maxLon = info.bounds[1][0];
+            if (info.bounds[1][1] > maxLat) maxLat = info.bounds[1][1];
         }
     });
-    if (bounds.length > 0 && dayMap) {
-        dayMap.fitBounds(bounds, { padding: [50, 50], maxZoom: 16 });
-        // Ouvrir le popup du premier track
-        if (dayTrackLayers[trackIds[0]]) dayTrackLayers[trackIds[0]].openPopup();
+    if (found) {
+        dayMap.fitBounds([[minLon, minLat], [maxLon, maxLat]], {
+            padding: { top: 60, bottom: 60, left: 60, right: 60 },
+            maxZoom: 16, pitch: 60
+        });
     }
 }
 
