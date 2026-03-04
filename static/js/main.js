@@ -377,13 +377,17 @@ function renderDayMap(tracks, sessionId) {
                 },
                 'terrain-source': {
                     type: 'raster-dem',
-                    url: 'https://demotiles.maplibre.org/terrain-tiles/tiles.json',
-                    tileSize: 256
+                    tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+                    encoding: 'terrarium',
+                    tileSize: 256,
+                    maxzoom: 15
                 },
                 'hillshade-source': {
                     type: 'raster-dem',
-                    url: 'https://demotiles.maplibre.org/terrain-tiles/tiles.json',
-                    tileSize: 256
+                    tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+                    encoding: 'terrarium',
+                    tileSize: 256,
+                    maxzoom: 15
                 }
             },
             layers: [
