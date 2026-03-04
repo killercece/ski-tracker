@@ -572,6 +572,39 @@ function zoomToTracks(trackIds) {
 // Garder l'ancien nom pour compatibilite
 function zoomToDayTrack(trackId) { zoomToTracks([trackId]); }
 
+function computePointSpeeds(points) {
+    if (!points || points.length < 2) return points;
+    var result = [];
+    for (var i = 0; i < points.length; i++) {
+        var p = Object.assign({}, points[i]);
+        if (i === 0) {
+            p.speed = 0;
+        } else {
+            var p0 = points[i - 1];
+            var dlat = (p.latitude - p0.latitude) * 111320;
+            var dlon = (p.longitude - p0.longitude) * 111320 * Math.cos(p0.latitude * Math.PI / 180);
+            var dz = (p.elevation || 0) - (p0.elevation || 0);
+            var dist = Math.sqrt(dlat * dlat + dlon * dlon + dz * dz);
+            var t0 = p0.time ? new Date(p0.time).getTime() : 0;
+            var t1 = p.time ? new Date(p.time).getTime() : 0;
+            var dt = (t1 - t0) / 1000; // secondes
+            p.speed = dt > 0 ? (dist / dt) * 3.6 : 0; // km/h
+        }
+        result.push(p);
+    }
+    // Lissage (moyenne mobile sur 3 points)
+    var smoothed = [];
+    for (var i = 0; i < result.length; i++) {
+        var s = Object.assign({}, result[i]);
+        var sum = result[i].speed, cnt = 1;
+        if (i > 0) { sum += result[i - 1].speed; cnt++; }
+        if (i < result.length - 1) { sum += result[i + 1].speed; cnt++; }
+        s.speed = sum / cnt;
+        smoothed.push(s);
+    }
+    return smoothed;
+}
+
 function showPisteDetail(index) {
     var item = timelineData[index];
     if (!item || item.type !== 'descent') return;
@@ -593,11 +626,16 @@ function showPisteDetail(index) {
     setText('piste-detail-avg-speed', fmt1(item.avg_speed) + ' km/h');
     setText('piste-detail-max-speed', fmt1(item.max_speed) + ' km/h');
 
-    // Dessiner les profils
-    drawSpeedProfile(item.points);
-    draw3DProfile(item.points);
+    // Calculer les vitesses par point (distance/temps entre points consecutifs)
+    var enrichedPoints = computePointSpeeds(item.points);
 
+    // Afficher le panel AVANT de dessiner (sinon canvas a 0 de largeur)
     panel.classList.remove('hidden');
+
+    // Dessiner les profils
+    drawSpeedProfile(enrichedPoints);
+    draw3DProfile(enrichedPoints);
+
     panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
