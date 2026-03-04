@@ -977,8 +977,55 @@ def match_session_pistes(session_id):
 
     db.commit()
 
+    # Recalculer les stats de session (uniquement descentes matchées + lifts)
+    _update_session_stats(session_id)
+
     logger.info("Matching terminé pour session %d : %d descentes, %d remontées",
                 session_id, len(descents), len(lifts))
+
+
+def _update_session_stats(session_id):
+    """Recalcule les stats d'une session depuis les tracks visibles (descentes matchées + lifts)."""
+    db = get_db()
+    tracks = db.execute("""
+        SELECT segment_type, distance, elevation_change, avg_speed, max_speed, duration_seconds
+        FROM tracks WHERE session_id = ?
+        AND ((segment_type = 'descent' AND piste_name IS NOT NULL) OR segment_type = 'lift')
+    """, (session_id,)).fetchall()
+
+    total_distance = 0.0
+    elev_gain = 0.0
+    elev_loss = 0.0
+    max_speed = 0.0
+    num_descents = 0
+    total_duration = 0
+    speed_time = 0.0
+    descent_time = 0
+
+    for t in tracks:
+        total_distance += t['distance'] or 0
+        total_duration += t['duration_seconds'] or 0
+        ec = t['elevation_change'] or 0
+        if ec > 0:
+            elev_gain += ec
+        else:
+            elev_loss += abs(ec)
+        if (t['max_speed'] or 0) > max_speed:
+            max_speed = t['max_speed'] or 0
+        if t['segment_type'] == 'descent':
+            num_descents += 1
+            speed_time += (t['avg_speed'] or 0) * (t['duration_seconds'] or 0)
+            descent_time += t['duration_seconds'] or 0
+
+    avg_speed = speed_time / descent_time if descent_time > 0 else 0.0
+
+    db.execute("""UPDATE sessions SET
+        total_distance=?, total_elevation_gain=?, total_elevation_loss=?,
+        max_speed=?, avg_speed=?, num_descents=?, duration_seconds=?
+        WHERE id=?""",
+        (round(total_distance, 2), round(elev_gain, 2), round(elev_loss, 2),
+         round(max_speed, 2), round(avg_speed, 2), num_descents, total_duration, session_id))
+    db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -1215,6 +1262,19 @@ def api_sessions():
     """Liste les sessions de l'utilisateur connecté."""
     try:
         db = get_db()
+
+        # Vérifier si des sessions ont des descentes non matchées → forcer le matching
+        unmatched = db.execute("""
+            SELECT DISTINCT t.session_id FROM tracks t
+            JOIN sessions s ON t.session_id = s.id
+            WHERE s.user_id = ? AND t.segment_type = 'descent' AND t.piste_name IS NULL
+        """, (session['user_id'],)).fetchall()
+        for row in unmatched:
+            try:
+                match_session_pistes(row['session_id'])
+            except Exception:
+                pass
+
         sessions = db.execute(
             """SELECT id, name, date, total_distance, total_elevation_gain,
                       total_elevation_loss, max_speed, avg_speed, num_descents,
