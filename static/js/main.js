@@ -342,24 +342,21 @@ function renderDayMap(tracks, sessionId) {
         'Remontees': L.layerGroup()
     };
 
-    var stepNumber = 0;
+    // Utiliser la timeline groupee (meme logique que le tableau)
+    var timeline = buildTimeline(tracks);
 
-    tracks.forEach(function(track) {
-        // Filtrer : uniquement descentes matchées et remontées
-        var isMatchedDescent = track.segment_type === 'descent' && track.piste_name;
-        var isLift = track.segment_type === 'lift';
-        if (!isMatchedDescent && !isLift) return;
-        if (!track.points || track.points.length < 2) return;
+    timeline.forEach(function(item) {
+        if (!item.points || item.points.length < 2) return;
 
-        stepNumber++;
-        var latlngs = track.points.map(function(p) { return [p.latitude, p.longitude]; });
+        var isLift = item.type === 'lift';
+        var latlngs = item.points.map(function(p) { return [p.latitude, p.longitude]; });
 
         // Style différencié
         var polylineStyle;
         if (isLift) {
             polylineStyle = { color: '#93c5fd', weight: 2, opacity: 0.4, dashArray: '6 8' };
         } else {
-            polylineStyle = { color: pisteColor(track.piste_difficulty), weight: 4, opacity: 0.85 };
+            polylineStyle = { color: pisteColor(item.piste_difficulty), weight: 4, opacity: 0.85 };
         }
 
         var polyline = L.polyline(latlngs, polylineStyle);
@@ -367,27 +364,25 @@ function renderDayMap(tracks, sessionId) {
         // Popup
         var popupContent = '<div style="font-family: Inter, sans-serif; font-size: 13px; line-height: 1.5;">';
         if (isLift) {
-            var liftName = track.piste_name ? track.piste_name : 'Remontee';
-            popupContent += '<strong>' + liftName + ' #' + stepNumber + '</strong>' +
-                '<br>Duree : ' + formatDuration(track.duration_seconds) +
-                '<br>Denivele : ' + fmt0(Math.abs(track.elevation_change)) + ' m';
+            var liftName = item.piste_name ? item.piste_name : 'Remontee';
+            popupContent += '<strong>' + liftName + ' #' + item.num + '</strong>' +
+                '<br>Duree : ' + formatDuration(item.duration_seconds) +
+                '<br>Denivele : ' + fmt0(Math.abs(item.elevation_change)) + ' m';
         } else {
-            popupContent += '<strong>Descente #' + stepNumber + '</strong>';
-            popupContent += '<br>Piste : <strong>' + track.piste_name + '</strong>';
-            if (track.piste_difficulty) popupContent += ' (' + pisteDifficultyLabel(track.piste_difficulty) + ')';
-            popupContent += '<br>Distance : ' + fmt1(track.distance) + ' km' +
-                '<br>Denivele : ' + fmt0(Math.abs(track.elevation_change)) + ' m' +
-                '<br>Duree : ' + formatDuration(track.duration_seconds) +
-                '<br>Vit. moy : ' + fmt1(track.avg_speed) + ' km/h' +
-                '<br>Vit. max : ' + fmt1(track.max_speed) + ' km/h';
-            if (track.match_confidence) {
-                popupContent += '<br><span style="color:#888;">Confiance : ' + Math.round(track.match_confidence * 100) + '%</span>';
-            }
+            popupContent += '<strong>Descente #' + item.num + '</strong>';
+            popupContent += '<br>Piste : <strong>' + item.piste_name + '</strong>';
+            if (item.piste_difficulty) popupContent += ' (' + pisteDifficultyLabel(item.piste_difficulty) + ')';
+            popupContent += '<br>Distance : ' + fmt1(item.distance) + ' km' +
+                '<br>Denivele : ' + fmt0(Math.abs(item.elevation_change)) + ' m' +
+                '<br>Duree : ' + formatDuration(item.duration_seconds) +
+                '<br>Vit. moy : ' + fmt1(item.avg_speed) + ' km/h' +
+                '<br>Vit. max : ' + fmt1(item.max_speed) + ' km/h';
         }
         popupContent += '</div>';
         polyline.bindPopup(popupContent);
 
-        dayTrackLayers[track.id] = polyline;
+        // Stocker chaque track_id du groupe pour zoomToTracks
+        item.track_ids.forEach(function(tid) { dayTrackLayers[tid] = polyline; });
 
         // Ajouter au layer group
         var layerName = isLift ? 'Remontees' : 'Descentes';
@@ -395,10 +390,9 @@ function renderDayMap(tracks, sessionId) {
         polyline.addTo(overlays[layerName]);
 
         // Marqueur numéroté au début du segment
-        var bgColor = isLift ? '#93c5fd' : pisteColor(track.piste_difficulty);
-        var textColor = '#fff';
+        var bgColor = isLift ? '#93c5fd' : pisteColor(item.piste_difficulty);
         var icon = L.divIcon({
-            html: '<div style="width:20px;height:20px;background:' + bgColor + ';border:2px solid white;border-radius:50%;color:' + textColor + ';font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,0.3);">' + stepNumber + '</div>',
+            html: '<div style="width:20px;height:20px;background:' + bgColor + ';border:2px solid white;border-radius:50%;color:#fff;font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,0.3);">' + item.num + '</div>',
             iconSize: [20, 20], iconAnchor: [10, 10], className: ''
         });
         L.marker(latlngs[0], { icon: icon }).addTo(dayMap);
@@ -418,15 +412,10 @@ function renderDayMap(tracks, sessionId) {
 }
 
 // ---------------------------------------------------------------------------
-// Vue jour : Tableau des descentes
+// Timeline : grouper pistes et remontees consecutives
 // ---------------------------------------------------------------------------
 
-function renderDayDescentsTable(tracks) {
-    var tbody = document.getElementById('day-descents-table');
-    var emptyEl = document.getElementById('day-descents-empty');
-    if (!tbody) return;
-
-    // Construire la timeline : grouper les pistes consecutives, intercaler les remontees
+function buildTimeline(tracks) {
     var timeline = [];
     var stepNum = 0;
 
@@ -434,10 +423,8 @@ function renderDayDescentsTable(tracks) {
         var t = tracks[i];
 
         if (t.segment_type === 'descent' && t.piste_name) {
-            // Verifier si meme piste que le dernier element timeline (si c'est aussi une descente)
             var last = timeline.length > 0 ? timeline[timeline.length - 1] : null;
             if (last && last.type === 'descent' && last.piste_name === t.piste_name) {
-                // Fusionner
                 last.distance += (t.distance || 0);
                 last.elevation_change += (t.elevation_change || 0);
                 last.duration_seconds += (t.duration_seconds || 0);
@@ -470,7 +457,6 @@ function renderDayDescentsTable(tracks) {
                 });
             }
         } else if (t.segment_type === 'lift') {
-            // Fusionner les remontées consécutives de même nom
             var last = timeline.length > 0 ? timeline[timeline.length - 1] : null;
             if (last && last.type === 'lift' && t.piste_name && last.piste_name === t.piste_name) {
                 last.distance += (t.distance || 0);
@@ -503,8 +489,20 @@ function renderDayDescentsTable(tracks) {
                 });
             }
         }
-        // Ignorer les pauses et descentes non-matchees
     }
+    return timeline;
+}
+
+// ---------------------------------------------------------------------------
+// Vue jour : Tableau des descentes
+// ---------------------------------------------------------------------------
+
+function renderDayDescentsTable(tracks) {
+    var tbody = document.getElementById('day-descents-table');
+    var emptyEl = document.getElementById('day-descents-empty');
+    if (!tbody) return;
+
+    var timeline = buildTimeline(tracks);
 
     // Stocker dans la variable globale pour showPisteDetail
     timelineData = timeline;
