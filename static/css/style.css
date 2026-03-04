@@ -201,7 +201,9 @@ main {
 }
 
 /* Canvas profil */
-#piste-profile-canvas {
+#piste-profile-canvas,
+#piste-3d-canvas {
     display: block;
     max-width: 100%;
+    touch-action: none;
 }

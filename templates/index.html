@@ -137,9 +137,18 @@
                 <div><span class="text-xs text-zinc-500 block">Vit. moy</span><span id="piste-detail-avg-speed" class="font-semibold tabular-nums"></span></div>
                 <div><span class="text-xs text-zinc-500 block">Vit. max</span><span id="piste-detail-max-speed" class="font-semibold tabular-nums"></span></div>
             </div>
-            <div class="p-4">
+            <!-- Vue 3D du tracé -->
+            <div class="p-4 pb-2">
+                <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-2">Tracé 3D</p>
+                <canvas id="piste-3d-canvas" height="280" class="w-full rounded-lg bg-zinc-50 dark:bg-zinc-950" style="cursor:grab"></canvas>
+            </div>
+            <!-- Profil altitude -->
+            <div class="px-4 pb-2">
+                <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-2">Profil altitude</p>
                 <canvas id="piste-profile-canvas" height="180" class="w-full"></canvas>
-                <div class="flex items-center justify-center gap-4 mt-2 text-xs text-zinc-500">
+            </div>
+            <div class="px-4 pb-4">
+                <div class="flex items-center justify-center gap-4 text-xs text-zinc-500">
                     <span class="flex items-center gap-1"><span class="w-3 h-0.5 rounded-full" style="background:#22c55e"></span> &lt;20 km/h</span>
                     <span class="flex items-center gap-1"><span class="w-3 h-0.5 rounded-full" style="background:#eab308"></span> 20-40</span>
                     <span class="flex items-center gap-1"><span class="w-3 h-0.5 rounded-full" style="background:#f97316"></span> 40-60</span>

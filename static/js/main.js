@@ -593,8 +593,9 @@ function showPisteDetail(index) {
     setText('piste-detail-avg-speed', fmt1(item.avg_speed) + ' km/h');
     setText('piste-detail-max-speed', fmt1(item.max_speed) + ' km/h');
 
-    // Dessiner le profil
+    // Dessiner les profils
     drawSpeedProfile(item.points);
+    draw3DProfile(item.points);
 
     panel.classList.remove('hidden');
     panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -712,6 +713,208 @@ function drawSpeedProfile(points) {
         var label = dd >= 1000 ? (dd / 1000).toFixed(1) + 'km' : Math.round(dd) + 'm';
         ctx.fillText(label, x(dd), pad.top + gH + 5);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Vue 3D du trace
+// ---------------------------------------------------------------------------
+
+var _3d_rotation = -0.6; // angle initial (radians)
+var _3d_points = null;
+var _3d_dragging = false;
+var _3d_lastX = 0;
+
+function draw3DProfile(points) {
+    var canvas = document.getElementById('piste-3d-canvas');
+    if (!canvas || !points || points.length < 2) return;
+
+    _3d_points = points;
+
+    // Initialiser les événements souris une seule fois
+    if (!canvas._3dInit) {
+        canvas._3dInit = true;
+        canvas.addEventListener('mousedown', function(e) {
+            _3d_dragging = true;
+            _3d_lastX = e.clientX;
+            canvas.style.cursor = 'grabbing';
+        });
+        window.addEventListener('mousemove', function(e) {
+            if (!_3d_dragging) return;
+            var dx = e.clientX - _3d_lastX;
+            _3d_lastX = e.clientX;
+            _3d_rotation += dx * 0.008;
+            _render3D(canvas, _3d_points, _3d_rotation);
+        });
+        window.addEventListener('mouseup', function() {
+            _3d_dragging = false;
+            canvas.style.cursor = 'grab';
+        });
+        // Touch
+        canvas.addEventListener('touchstart', function(e) {
+            _3d_dragging = true;
+            _3d_lastX = e.touches[0].clientX;
+        }, { passive: true });
+        window.addEventListener('touchmove', function(e) {
+            if (!_3d_dragging) return;
+            var dx = e.touches[0].clientX - _3d_lastX;
+            _3d_lastX = e.touches[0].clientX;
+            _3d_rotation += dx * 0.008;
+            _render3D(canvas, _3d_points, _3d_rotation);
+        }, { passive: true });
+        window.addEventListener('touchend', function() { _3d_dragging = false; });
+    }
+
+    _render3D(canvas, points, _3d_rotation);
+}
+
+function _render3D(canvas, points, angle) {
+    var ctx = canvas.getContext('2d');
+    var dpr = window.devicePixelRatio || 1;
+    var rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = 280 * dpr;
+    ctx.scale(dpr, dpr);
+    var W = rect.width, H = 280;
+
+    // Calculer les coordonnées locales en mètres
+    var refLat = points[0].latitude;
+    var refLon = points[0].longitude;
+    var cosLat = Math.cos(refLat * Math.PI / 180);
+    var coords = [];
+    for (var i = 0; i < points.length; i++) {
+        var p = points[i];
+        coords.push({
+            x: (p.longitude - refLon) * 111320 * cosLat,
+            y: (p.latitude - refLat) * 111320,
+            z: (p.elevation || 0),
+            speed: p.speed || 0
+        });
+    }
+
+    // Bornes
+    var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (var i = 0; i < coords.length; i++) {
+        if (coords[i].x < minX) minX = coords[i].x;
+        if (coords[i].x > maxX) maxX = coords[i].x;
+        if (coords[i].y < minY) minY = coords[i].y;
+        if (coords[i].y > maxY) maxY = coords[i].y;
+        if (coords[i].z < minZ) minZ = coords[i].z;
+        if (coords[i].z > maxZ) maxZ = coords[i].z;
+    }
+    var rangeX = maxX - minX || 1;
+    var rangeY = maxY - minY || 1;
+    var rangeZ = maxZ - minZ || 1;
+    var cx = (minX + maxX) / 2;
+    var cy = (minY + maxY) / 2;
+    var cz = (minZ + maxZ) / 2;
+
+    // Normaliser autour du centre
+    var maxRange = Math.max(rangeX, rangeY);
+    var norm = [];
+    for (var i = 0; i < coords.length; i++) {
+        norm.push({
+            x: (coords[i].x - cx) / maxRange,
+            y: (coords[i].y - cy) / maxRange,
+            z: (coords[i].z - cz) / maxRange * 1.5, // exagerer l'altitude
+            speed: coords[i].speed
+        });
+    }
+
+    // Projection isometrique avec rotation
+    var cosA = Math.cos(angle);
+    var sinA = Math.sin(angle);
+    var tilt = 0.55; // inclinaison verticale
+
+    function project(pt) {
+        var rx = pt.x * cosA - pt.y * sinA;
+        var ry = pt.x * sinA + pt.y * cosA;
+        var sx = W / 2 + rx * W * 0.38;
+        var sy = H * 0.55 - pt.z * H * 0.35 - ry * H * tilt * 0.25;
+        return { x: sx, y: sy };
+    }
+
+    function speedColor(spd) {
+        if (spd < 20) return '#22c55e';
+        if (spd < 40) return '#eab308';
+        if (spd < 60) return '#f97316';
+        return '#ef4444';
+    }
+
+    // Theme
+    var isDark = document.documentElement.classList.contains('dark');
+
+    ctx.clearRect(0, 0, W, H);
+
+    // Grille au sol
+    ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)';
+    ctx.lineWidth = 0.5;
+    var gridN = 8;
+    for (var g = 0; g <= gridN; g++) {
+        var t = g / gridN - 0.5;
+        var a1 = project({ x: t, y: -0.5, z: (minZ - cz) / maxRange * 1.5 });
+        var a2 = project({ x: t, y: 0.5, z: (minZ - cz) / maxRange * 1.5 });
+        ctx.beginPath(); ctx.moveTo(a1.x, a1.y); ctx.lineTo(a2.x, a2.y); ctx.stroke();
+        var b1 = project({ x: -0.5, y: t, z: (minZ - cz) / maxRange * 1.5 });
+        var b2 = project({ x: 0.5, y: t, z: (minZ - cz) / maxRange * 1.5 });
+        ctx.beginPath(); ctx.moveTo(b1.x, b1.y); ctx.lineTo(b2.x, b2.y); ctx.stroke();
+    }
+
+    // Ombre du trace au sol
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)';
+    ctx.beginPath();
+    for (var i = 0; i < norm.length; i++) {
+        var p = project({ x: norm[i].x, y: norm[i].y, z: (minZ - cz) / maxRange * 1.5 });
+        if (i === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+
+    // Piliers au debut et fin
+    ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.12)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    [0, norm.length - 1].forEach(function(idx) {
+        var top = project(norm[idx]);
+        var bot = project({ x: norm[idx].x, y: norm[idx].y, z: (minZ - cz) / maxRange * 1.5 });
+        ctx.beginPath(); ctx.moveTo(top.x, top.y); ctx.lineTo(bot.x, bot.y); ctx.stroke();
+    });
+    ctx.setLineDash([]);
+
+    // Trace 3D colore par vitesse
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    for (var i = 1; i < norm.length; i++) {
+        var p0 = project(norm[i - 1]);
+        var p1 = project(norm[i]);
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
+        ctx.strokeStyle = speedColor(norm[i].speed);
+        ctx.stroke();
+    }
+
+    // Points debut/fin
+    var startP = project(norm[0]);
+    var endP = project(norm[norm.length - 1]);
+    ctx.fillStyle = '#22c55e';
+    ctx.beginPath(); ctx.arc(startP.x, startP.y, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#ef4444';
+    ctx.beginPath(); ctx.arc(endP.x, endP.y, 5, 0, Math.PI * 2); ctx.fill();
+
+    // Labels altitude
+    ctx.font = '10px Inter, sans-serif';
+    ctx.fillStyle = isDark ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.4)';
+    ctx.textAlign = 'left';
+    ctx.fillText(Math.round(coords[0].z) + 'm', startP.x + 8, startP.y - 2);
+    ctx.textAlign = 'right';
+    ctx.fillText(Math.round(coords[coords.length - 1].z) + 'm', endP.x - 8, endP.y - 2);
+
+    // Instruction rotation
+    ctx.textAlign = 'center';
+    ctx.fillStyle = isDark ? 'rgba(255,255,255,0.25)' : 'rgba(0,0,0,0.2)';
+    ctx.font = '10px Inter, sans-serif';
+    ctx.fillText('Glisser pour tourner', W / 2, H - 8);
 }
 
 // ---------------------------------------------------------------------------
