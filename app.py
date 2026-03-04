@@ -4,13 +4,11 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.4.5'
+__version__ = '1.4.6'
 
 import os
 import logging
-import re
 import sqlite3
-import unicodedata
 from collections import defaultdict
 from datetime import datetime
 from functools import wraps
@@ -18,7 +16,6 @@ from math import radians, cos, sin, asin, sqrt
 from pathlib import Path
 
 import json
-import requests
 
 import gpxpy
 from flask import Flask, g, request, jsonify, render_template, session, redirect, url_for
@@ -115,21 +112,6 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_points_track ON track_points(track_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_date ON sessions(date);
 
-        CREATE TABLE IF NOT EXISTS osm_pistes (
-            osm_id INTEGER PRIMARY KEY,
-            name TEXT,
-            difficulty TEXT,
-            geometry TEXT,
-            bbox_min_lat REAL, bbox_max_lat REAL,
-            bbox_min_lon REAL, bbox_max_lon REAL,
-            fetched_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS osm_fetch_zones (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            min_lat REAL, max_lat REAL,
-            min_lon REAL, max_lon REAL,
-            fetched_at TEXT
-        );
         CREATE TABLE IF NOT EXISTS reference_pistes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -159,8 +141,8 @@ def init_db():
     conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version TEXT PRIMARY KEY)")
     applied = {r[0] for r in conn.execute("SELECT version FROM schema_version").fetchall()}
     if '1.4.3' not in applied:
-        conn.execute("DELETE FROM osm_pistes")
-        conn.execute("DELETE FROM osm_fetch_zones")
+        conn.execute("DELETE FROM osm_pistes") if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='osm_pistes'").fetchone() else None
+        conn.execute("DELETE FROM osm_fetch_zones") if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='osm_fetch_zones'").fetchone() else None
         conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
         conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.3')")
         logger.info("Migration v1.4.3 : cache et matchs purgés (one-shot)")
@@ -168,6 +150,15 @@ def init_db():
         conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
         conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.5')")
         logger.info("Migration v1.4.5 : matchs purgés pour reference_pistes")
+    if '1.4.6' not in applied:
+        # Supprimer les tables OSM devenues inutiles
+        conn.execute("DROP TABLE IF EXISTS osm_pistes")
+        conn.execute("DROP TABLE IF EXISTS osm_fetch_zones")
+        # Purger reference_pistes pour reconstruction depuis JSON
+        conn.execute("DELETE FROM reference_pistes")
+        conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.6')")
+        logger.info("Migration v1.4.6 : tables OSM supprimées, référence rechargée depuis JSON")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
@@ -584,246 +575,16 @@ def compute_session_stats(segments):
 # Matching descentes ↔ pistes OSM
 # ---------------------------------------------------------------------------
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-PISTE_CACHE_TTL_DAYS = 30
 MATCH_DISTANCE_THRESHOLD = 80  # mètres
 MATCH_MIN_SCORE = 0.50  # 50% des points doivent matcher
 
 
-def _reconstruct_relation_geometry(member_ways, ways, nodes):
-    """Reconstitue la géométrie d'une relation en concaténant ses ways membres dans l'ordre."""
-    # Extraire les séquences de nodes pour chaque way membre
-    segments = []
-    for m in member_ways:
-        way_id = m['ref']
-        way = ways.get(way_id)
-        if not way:
-            continue
-        seg_nodes = []
-        for nd_id in way.get('nodes', []):
-            if nd_id in nodes:
-                seg_nodes.append((nd_id, list(nodes[nd_id])))
-        if seg_nodes:
-            segments.append(seg_nodes)
-
-    if not segments:
-        return []
-
-    # Ordonner et chaîner les segments bout à bout
-    ordered = [segments[0]]
-    used = {0}
-
-    for _ in range(len(segments) - 1):
-        last_node_id = ordered[-1][-1][0]
-        # Trouver le segment suivant dont le début ou la fin correspond
-        best_idx = None
-        reverse = False
-        for idx, seg in enumerate(segments):
-            if idx in used:
-                continue
-            if seg[0][0] == last_node_id:
-                best_idx = idx
-                reverse = False
-                break
-            if seg[-1][0] == last_node_id:
-                best_idx = idx
-                reverse = True
-                break
-
-        if best_idx is None:
-            # Pas de continuation trouvée, prendre le suivant non utilisé
-            for idx in range(len(segments)):
-                if idx not in used:
-                    best_idx = idx
-                    break
-            if best_idx is None:
-                break
-
-        seg = segments[best_idx]
-        if reverse:
-            seg = list(reversed(seg))
-        ordered.append(seg)
-        used.add(best_idx)
-
-    # Concaténer en évitant les doublons aux jonctions
-    geometry = [pt for _, pt in ordered[0]]
-    last_node_id = ordered[0][-1][0]
-    for seg in ordered[1:]:
-        skip = 1 if seg[0][0] == last_node_id else 0
-        geometry.extend(pt for _, pt in seg[skip:])
-        last_node_id = seg[-1][0]
-
-    return geometry
-
-
-def _extract_piste_name(tags):
-    """Extrait le nom d'une piste depuis ses tags OSM (priorité : name:fr > name > piste:name > ref)."""
-    return (tags.get('name:fr')
-            or tags.get('name')
-            or tags.get('piste:name')
-            or tags.get('ref')
-            or tags.get('piste:ref')
-            or '')
-
-
-def fetch_osm_pistes(min_lat, max_lat, min_lon, max_lon):
-    """Récupère les pistes de ski (ways + relations) depuis Overpass API et les cache en BDD."""
-    query = f"""
-    [out:json][timeout:45];
-    (
-      way["piste:type"="downhill"]({min_lat},{min_lon},{max_lat},{max_lon});
-      relation["piste:type"="downhill"]({min_lat},{min_lon},{max_lat},{max_lon});
-    );
-    out body;
-    >;
-    out skel qt;
-    """
-    try:
-        resp = requests.post(OVERPASS_URL, data={'data': query}, timeout=45)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logger.error("Erreur Overpass API : %s", e)
-        return 0
-
-    # Indexer les nodes
-    nodes = {}
-    # Indexer les ways pour reconstruire les géométries des relations
-    ways = {}
-    for el in data.get('elements', []):
-        if el['type'] == 'node':
-            nodes[el['id']] = (el['lat'], el['lon'])
-        elif el['type'] == 'way':
-            ways[el['id']] = el
-
-    # Collecter les way IDs qui appartiennent à une relation de piste
-    # (pour éviter les doublons : on préfère la relation qui porte le nom)
-    ways_in_relations = {}
-
+def ensure_pistes_cached(session_id=None):
+    """Vérifie que les pistes de référence sont chargées en BDD."""
     db = get_db()
-    count = 0
-
-    # --- Traiter les relations d'abord ---
-    for el in data.get('elements', []):
-        if el['type'] != 'relation':
-            continue
-        tags = el.get('tags', {})
-        if tags.get('piste:type') != 'downhill':
-            continue
-
-        rel_id = el['id']
-        rel_name = _extract_piste_name(tags)
-        rel_difficulty = tags.get('piste:difficulty', 'unknown')
-
-        # Reconstituer la géométrie à partir des ways membres
-        member_ways = [m for m in el.get('members', []) if m['type'] == 'way']
-        geometry = _reconstruct_relation_geometry(member_ways, ways, nodes)
-
-        if len(geometry) < 2:
-            continue
-
-        # Marquer les ways membres pour éviter les doublons
-        for m in member_ways:
-            ways_in_relations[m['ref']] = rel_id
-
-        lats = [p[0] for p in geometry]
-        lons = [p[1] for p in geometry]
-
-        db.execute("""
-            INSERT OR REPLACE INTO osm_pistes
-            (osm_id, name, difficulty, geometry, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        """, (rel_id, rel_name, rel_difficulty, json.dumps(geometry),
-              min(lats), max(lats), min(lons), max(lons)))
-        count += 1
-
-    # --- Traiter les ways individuels (hors relations) ---
-    for el in data.get('elements', []):
-        if el['type'] != 'way':
-            continue
-        tags = el.get('tags', {})
-        if tags.get('piste:type') != 'downhill':
-            continue
-
-        osm_id = el['id']
-        # Sauter les ways déjà inclus dans une relation
-        if osm_id in ways_in_relations:
-            continue
-
-        name = _extract_piste_name(tags)
-        difficulty = tags.get('piste:difficulty', 'unknown')
-
-        # Construire la géométrie
-        geometry = []
-        for nd_id in el.get('nodes', []):
-            if nd_id in nodes:
-                geometry.append(list(nodes[nd_id]))
-
-        if len(geometry) < 2:
-            continue
-
-        lats = [p[0] for p in geometry]
-        lons = [p[1] for p in geometry]
-
-        db.execute("""
-            INSERT OR REPLACE INTO osm_pistes
-            (osm_id, name, difficulty, geometry, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        """, (osm_id, name, difficulty, json.dumps(geometry),
-              min(lats), max(lats), min(lons), max(lons)))
-        count += 1
-
-    # Enregistrer la zone fetchée
-    db.execute("""
-        INSERT INTO osm_fetch_zones (min_lat, max_lat, min_lon, max_lon, fetched_at)
-        VALUES (?, ?, ?, ?, datetime('now'))
-    """, (min_lat, max_lat, min_lon, max_lon))
-    db.commit()
-    logger.info("Overpass : %d pistes récupérées (ways + relations) pour bbox [%.4f,%.4f,%.4f,%.4f]",
-                count, min_lat, min_lon, max_lat, max_lon)
-    return count
-
-
-def ensure_pistes_cached(session_id):
-    """Vérifie que les pistes OSM sont en cache pour la zone de la session."""
-    db = get_db()
-
-    # Calculer la bounding box des points de la session
-    bbox = db.execute("""
-        SELECT MIN(tp.latitude) as min_lat, MAX(tp.latitude) as max_lat,
-               MIN(tp.longitude) as min_lon, MAX(tp.longitude) as max_lon
-        FROM track_points tp
-        JOIN tracks t ON tp.track_id = t.id
-        WHERE t.session_id = ?
-    """, (session_id,)).fetchone()
-
-    if not bbox or bbox['min_lat'] is None:
-        return
-
-    # Ajouter une marge de 0.01° (~1km)
-    margin = 0.01
-    min_lat = bbox['min_lat'] - margin
-    max_lat = bbox['max_lat'] + margin
-    min_lon = bbox['min_lon'] - margin
-    max_lon = bbox['max_lon'] + margin
-
-    # Vérifier si on a déjà fetché cette zone récemment
-    existing = db.execute("""
-        SELECT id FROM osm_fetch_zones
-        WHERE min_lat <= ? AND max_lat >= ? AND min_lon <= ? AND max_lon >= ?
-        AND fetched_at > datetime('now', ?)
-    """, (min_lat, max_lat, min_lon, max_lon, f'-{PISTE_CACHE_TTL_DAYS} days')).fetchone()
-
-    if existing:
-        # Vérifier que reference_pistes est rempli, sinon reconstruire
-        ref_count = db.execute("SELECT COUNT(*) as cnt FROM reference_pistes").fetchone()['cnt']
-        osm_count = db.execute("SELECT COUNT(*) as cnt FROM osm_pistes").fetchone()['cnt']
-        if ref_count == 0 and osm_count > 0:
-            build_reference_pistes()
-        return
-
-    fetch_osm_pistes(min_lat, max_lat, min_lon, max_lon)
-    build_reference_pistes()
+    count = db.execute("SELECT COUNT(*) as cnt FROM reference_pistes").fetchone()['cnt']
+    if count == 0:
+        build_reference_pistes()
 
 
 def point_to_segment_distance(lat, lon, lat1, lon1, lat2, lon2):
@@ -932,97 +693,47 @@ def match_track_to_piste(track_id):
           round(best_score, 2), track_id))
 
 
-def _normalize_piste_name(name):
-    """Normalise un nom de piste pour la comparaison fuzzy.
-
-    Supprime accents, articles, apostrophes, abréviations courantes.
-    Ex: "La croix d'Antide" → "croix antide"
-        "Boulevard Goitschel" → "boulevard goitschel"
-        "Bouvreuil bleu" → "bouvreuil bleu"
-    """
-    if not name:
-        return ''
-    # Minuscules
-    s = name.lower()
-    # Supprimer les accents (NFD → strip combining marks)
-    s = unicodedata.normalize('NFD', s)
-    s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
-    # Remplacer apostrophes et tirets par espace
-    s = re.sub(r"[''`\-]", ' ', s)
-    # Supprimer tout ce qui n'est pas alphanumérique ou espace
-    s = re.sub(r'[^a-z0-9 ]', '', s)
-    # Développer les abréviations courantes
-    abbreviations = {
-        'bd': 'boulevard',
-        'st': 'saint',
-    }
-    words = s.split()
-    words = [abbreviations.get(w, w) for w in words]
-    # Supprimer les articles
-    articles = {'le', 'la', 'les', 'l', 'du', 'de', 'des', 'd'}
-    words = [w for w in words if w not in articles]
-    # Normaliser les suffixes genrés (bleue→bleu, rouge est invariable)
-    words = [re.sub(r'e$', '', w) if w in ('bleue', 'verte', 'noire') else w for w in words]
-    return ' '.join(words).strip()
-
-
-def _build_reference_lookup():
-    """Construit un dictionnaire normalized_name → {name, difficulty, resort} depuis le fichier référence."""
+def build_reference_pistes():
+    """Charge les pistes de référence (noms officiels + géométries OSM) depuis le fichier JSON."""
     ref_path = os.path.join(app.static_folder, 'pistes_3v_reference.json')
     if not os.path.exists(ref_path):
-        return {}
+        logger.warning("Fichier de référence pistes introuvable : %s", ref_path)
+        return
     try:
         with open(ref_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except Exception as e:
         logger.warning("Impossible de charger le fichier de référence pistes : %s", e)
-        return {}
-    lookup = {}
+        return
+
+    db = get_db()
+    db.execute("DELETE FROM reference_pistes")
+
+    inserted = 0
+    piste_names = set()
     for resort_key, resort_data in data.get('resorts', {}).items():
         resort_label = resort_data.get('label', resort_key)
         for p in resort_data.get('pistes', []):
-            key = _normalize_piste_name(p['name'])
-            if key:
-                lookup[key] = {'name': p['name'], 'difficulty': p['difficulty'], 'resort': resort_label}
-    return lookup
-
-
-def build_reference_pistes():
-    """Construit la table reference_pistes en croisant noms officiels et géométries OSM."""
-    db = get_db()
-    lookup = _build_reference_lookup()
-    if not lookup:
-        return
-
-    # Vider et reconstruire (idempotent)
-    db.execute("DELETE FROM reference_pistes")
-
-    # Pour chaque piste OSM nommée, chercher dans la référence
-    osm_pistes = db.execute("""
-        SELECT osm_id, name, difficulty, geometry,
-               bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon
-        FROM osm_pistes WHERE name IS NOT NULL AND name != ''
-    """).fetchall()
-
-    inserted = 0
-    matched_names = set()
-    for piste in osm_pistes:
-        norm = _normalize_piste_name(piste['name'])
-        ref = lookup.get(norm)
-        if ref:
-            db.execute("""INSERT INTO reference_pistes
-                (name, difficulty, resort, osm_id, geometry,
-                 bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (ref['name'], ref['difficulty'], ref['resort'], piste['osm_id'],
-                 piste['geometry'], piste['bbox_min_lat'], piste['bbox_max_lat'],
-                 piste['bbox_min_lon'], piste['bbox_max_lon']))
-            inserted += 1
-            matched_names.add(ref['name'])
+            geometries = p.get('geometries', [])
+            if not geometries:
+                continue
+            for geom in geometries:
+                if len(geom) < 2:
+                    continue
+                lats = [pt[0] for pt in geom]
+                lons = [pt[1] for pt in geom]
+                db.execute("""INSERT INTO reference_pistes
+                    (name, difficulty, resort, geometry,
+                     bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (p['name'], p['difficulty'], resort_label, json.dumps(geom),
+                     min(lats), max(lats), min(lons), max(lons)))
+                inserted += 1
+            piste_names.add(p['name'])
 
     db.commit()
-    logger.info("Reference pistes : %d segments OSM liés à %d pistes officielles",
-                inserted, len(matched_names))
+    logger.info("Reference pistes chargées : %d segments pour %d pistes officielles",
+                inserted, len(piste_names))
 
 
 def match_session_pistes(session_id):

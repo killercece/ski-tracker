@@ -332,9 +332,7 @@ function renderDayMap(tracks, sessionId) {
     }).addTo(dayMap);
 
     var allBounds = [];
-    var pistesLayer = L.layerGroup();
     var overlays = {
-        'Pistes OSM': pistesLayer,
         'Descentes': L.layerGroup(),
         'Remontees': L.layerGroup(),
         'Pauses': L.layerGroup()
@@ -404,9 +402,8 @@ function renderDayMap(tracks, sessionId) {
     });
 
     Object.keys(overlays).forEach(function(name) {
-        if (name !== 'Pistes OSM') overlays[name].addTo(dayMap);
+        overlays[name].addTo(dayMap);
     });
-    pistesLayer.addTo(dayMap);
 
     if (allBounds.length > 0) {
         var startIcon = L.divIcon({
@@ -426,43 +423,6 @@ function renderDayMap(tracks, sessionId) {
 
     L.control.layers(null, overlays, { collapsed: false }).addTo(dayMap);
 
-    // Charger les pistes OSM en arriere-plan
-    if (sessionId) {
-        loadPistesLayer(sessionId, pistesLayer);
-    }
-}
-
-async function loadPistesLayer(sessionId, pistesLayer) {
-    try {
-        var pistes = await api('/api/sessions/' + sessionId + '/pistes');
-        if (!pistes || pistes.length === 0) return;
-
-        pistes.forEach(function(piste) {
-            if (!piste.geometry || piste.geometry.length < 2) return;
-
-            var latlngs = piste.geometry.map(function(p) { return [p[0], p[1]]; });
-            var color = pisteColor(piste.difficulty);
-
-            var polyline = L.polyline(latlngs, {
-                color: color,
-                weight: 6,
-                opacity: 0.25,
-                dashArray: '8 6'
-            });
-
-            var name = piste.name || 'Sans nom';
-            polyline.bindPopup(
-                '<div style="font-family: Inter, sans-serif; font-size: 13px;">' +
-                '<strong>' + name + '</strong><br>' +
-                'Difficulte : ' + pisteDifficultyLabel(piste.difficulty) +
-                '</div>'
-            );
-
-            polyline.addTo(pistesLayer);
-        });
-    } catch (e) {
-        // Silencieux si les pistes ne chargent pas
-    }
 }
 
 // ---------------------------------------------------------------------------
