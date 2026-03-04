@@ -4,7 +4,7 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.4.10'
+__version__ = '1.4.11'
 
 import os
 import logging
@@ -179,12 +179,14 @@ def init_db():
         conn.execute("UPDATE tracks SET piste_name=NULL, piste_difficulty=NULL, piste_osm_id=NULL, match_confidence=NULL WHERE segment_type='lift'")
         conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.9')")
         logger.info("Migration v1.4.9 : matchs remontées purgés pour re-matching")
+    if '1.4.11' not in applied:
+        # Re-segmenter toutes les sessions (meilleure détection des remontées)
+        _resegment_all_sessions(conn)
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.11')")
+        logger.info("Migration v1.4.11 : re-segmentation terminée")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
-
-
-init_db()
 
 
 def login_required(f):
@@ -404,16 +406,18 @@ def compute_point_metrics(points):
 
 def classify_point(speed, elev_delta):
     """Classifie un point individuel en phase."""
-    if speed < 3.0:
+    # Montée même lente = remontée mécanique (télésièges enregistrent mal le GPS)
+    if elev_delta > 0.3 and speed < 15.0:
+        return 'lift'
+    if speed < 2.0 and abs(elev_delta) < 0.3:
         return 'pause'
     if elev_delta < 0 and speed > 5.0:
         return 'descent'
-    if elev_delta > 0 and speed < 15.0:
-        return 'lift'
-    # Zone ambiguë : privilégier descente si rapide
     if speed > 15.0:
         return 'descent'
-    return 'lift'
+    if elev_delta > 0:
+        return 'lift'
+    return 'pause'
 
 
 def detect_segments(points):
@@ -536,12 +540,12 @@ def _merge_short_segments(segments, min_points=3):
 
 
 def _validate_segments(segments):
-    """Valide les segments selon les seuils d'altitude (50m)."""
+    """Valide les segments selon les seuils d'altitude."""
     for seg in segments:
         elev = abs(seg['elevation_change'])
         if seg['type'] == 'descent' and elev < 50:
             seg['type'] = 'pause'
-        elif seg['type'] == 'lift' and elev < 50:
+        elif seg['type'] == 'lift' and elev < 20:
             seg['type'] = 'pause'
     return segments
 
@@ -589,6 +593,66 @@ def compute_session_stats(segments):
             stats[key] = round(stats[key], 2)
 
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Re-segmentation (migration)
+# ---------------------------------------------------------------------------
+
+
+def _resegment_all_sessions(conn):
+    """Re-segmente toutes les sessions avec l'algorithme amélioré."""
+    conn.row_factory = sqlite3.Row
+    sessions = conn.execute("SELECT id FROM sessions").fetchall()
+    for sess in sessions:
+        sid = sess['id']
+        # Récupérer tous les points triés par time
+        points = conn.execute("""
+            SELECT tp.latitude, tp.longitude, tp.elevation, tp.time, tp.speed
+            FROM track_points tp
+            JOIN tracks t ON tp.track_id = t.id
+            WHERE t.session_id = ?
+            ORDER BY tp.time, tp.point_order
+        """, (sid,)).fetchall()
+        if len(points) < 2:
+            continue
+        all_points = [{'latitude': p['latitude'], 'longitude': p['longitude'],
+                       'elevation': p['elevation'], 'time': p['time'],
+                       'speed': p['speed']} for p in points]
+        # Supprimer anciens tracks et points (CASCADE)
+        conn.execute("DELETE FROM tracks WHERE session_id = ?", (sid,))
+        # Re-segmenter
+        segments = detect_segments(all_points)
+        stats = compute_session_stats(segments)
+        # Recréer tracks et points
+        for seg in segments:
+            cur = conn.execute("""INSERT INTO tracks
+                (session_id, segment_type, start_time, end_time, distance,
+                 elevation_change, avg_speed, max_speed, duration_seconds)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (sid, seg['type'], seg['start_time'], seg['end_time'],
+                 seg['distance'], seg['elevation_change'], seg['avg_speed'],
+                 seg['max_speed'], seg['duration_seconds']))
+            track_id = cur.lastrowid
+            point_data = [(track_id, pt['latitude'], pt['longitude'],
+                           pt['elevation'], pt['time'], None, order)
+                          for order, pt in enumerate(seg['points'])]
+            conn.executemany("""INSERT INTO track_points
+                (track_id, latitude, longitude, elevation, time, speed, point_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""", point_data)
+        # Mettre à jour stats session
+        conn.execute("""UPDATE sessions SET
+            total_distance=?, total_elevation_gain=?, total_elevation_loss=?,
+            max_speed=?, avg_speed=?, num_descents=?, duration_seconds=?
+            WHERE id=?""",
+            (stats['total_distance'], stats['total_elevation_gain'],
+             stats['total_elevation_loss'], stats['max_speed'],
+             stats['avg_speed'], stats['num_descents'],
+             stats['duration_seconds'], sid))
+        logger.info("Re-segmentation session %d : %d segments", sid, len(segments))
+
+
+init_db()
 
 
 # ---------------------------------------------------------------------------
