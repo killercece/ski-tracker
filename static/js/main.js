@@ -470,21 +470,38 @@ function renderDayDescentsTable(tracks) {
                 });
             }
         } else if (t.segment_type === 'lift') {
-            stepNum++;
-            timeline.push({
-                type: 'lift',
-                num: stepNum,
-                piste_name: t.piste_name || null,
-                start_time: t.start_time,
-                end_time: t.end_time,
-                distance: t.distance || 0,
-                elevation_change: t.elevation_change || 0,
-                duration_seconds: t.duration_seconds || 0,
-                avg_speed: t.avg_speed || 0,
-                max_speed: t.max_speed || 0,
-                track_ids: [t.id],
-                points: t.points ? t.points.slice() : []
-            });
+            // Fusionner les remontées consécutives de même nom
+            var last = timeline.length > 0 ? timeline[timeline.length - 1] : null;
+            if (last && last.type === 'lift' && t.piste_name && last.piste_name === t.piste_name) {
+                last.distance += (t.distance || 0);
+                last.elevation_change += (t.elevation_change || 0);
+                last.duration_seconds += (t.duration_seconds || 0);
+                last.max_speed = Math.max(last.max_speed || 0, t.max_speed || 0);
+                last._total_speed_time += (t.avg_speed || 0) * (t.duration_seconds || 0);
+                last._total_time += (t.duration_seconds || 0);
+                last.avg_speed = last._total_time > 0 ? last._total_speed_time / last._total_time : 0;
+                last.track_ids.push(t.id);
+                last.points = last.points.concat(t.points || []);
+                if (!last.end_time || (t.end_time && t.end_time > last.end_time)) last.end_time = t.end_time;
+            } else {
+                stepNum++;
+                timeline.push({
+                    type: 'lift',
+                    num: stepNum,
+                    piste_name: t.piste_name || null,
+                    start_time: t.start_time,
+                    end_time: t.end_time,
+                    distance: t.distance || 0,
+                    elevation_change: t.elevation_change || 0,
+                    duration_seconds: t.duration_seconds || 0,
+                    avg_speed: t.avg_speed || 0,
+                    max_speed: t.max_speed || 0,
+                    track_ids: [t.id],
+                    points: t.points ? t.points.slice() : [],
+                    _total_speed_time: (t.avg_speed || 0) * (t.duration_seconds || 0),
+                    _total_time: t.duration_seconds || 0
+                });
+            }
         }
         // Ignorer les pauses et descentes non-matchees
     }
