@@ -300,14 +300,6 @@ async function loadDayData(dateStr) {
 
         var tracksData = await api('/api/sessions/' + sess.id + '/tracks');
 
-        setText('day-distance', fmt1(sess.total_distance));
-        setText('day-elev-gain', fmt0(sess.total_elevation_gain));
-        setText('day-elev-loss', fmt0(sess.total_elevation_loss));
-        setText('day-duration', formatDuration(sess.duration_seconds));
-        setText('day-avg-speed', fmt1(sess.avg_speed));
-        setText('day-max-speed', fmt1(sess.max_speed));
-        setText('day-descents', sess.num_descents || 0);
-
         var flatTracks = tracksData.map(function(item) {
             var flat = Object.assign({}, item.track);
             flat.points = item.points;
@@ -316,6 +308,16 @@ async function loadDayData(dateStr) {
         currentFlatTracks = flatTracks;
         renderDayMap(flatTracks, sess.id);
         renderDayDescentsTable(flatTracks);
+
+        // Stats calculees depuis la timeline (uniquement descentes matchees + remontees)
+        var stats = computeTimelineStats(timelineData);
+        setText('day-distance', fmt1(stats.distance));
+        setText('day-elev-gain', fmt0(stats.elevGain));
+        setText('day-elev-loss', fmt0(stats.elevLoss));
+        setText('day-duration', formatDuration(stats.duration));
+        setText('day-avg-speed', fmt1(stats.avgSpeed));
+        setText('day-max-speed', fmt1(stats.maxSpeed));
+        setText('day-descents', stats.numDescents);
     } catch (e) {}
 }
 
@@ -491,6 +493,31 @@ function buildTimeline(tracks) {
         }
     }
     return timeline;
+}
+
+function computeTimelineStats(timeline) {
+    var distance = 0, elevGain = 0, elevLoss = 0, duration = 0;
+    var maxSpeed = 0, numDescents = 0;
+    var totalSpeedTime = 0, totalDescentTime = 0;
+
+    for (var i = 0; i < timeline.length; i++) {
+        var item = timeline[i];
+        distance += item.distance || 0;
+        duration += item.duration_seconds || 0;
+        var elev = item.elevation_change || 0;
+        if (elev > 0) elevGain += elev;
+        else elevLoss += Math.abs(elev);
+        if (item.max_speed > maxSpeed) maxSpeed = item.max_speed;
+        if (item.type === 'descent') {
+            numDescents++;
+            totalSpeedTime += (item.avg_speed || 0) * (item.duration_seconds || 0);
+            totalDescentTime += item.duration_seconds || 0;
+        }
+    }
+    var avgSpeed = totalDescentTime > 0 ? totalSpeedTime / totalDescentTime : 0;
+    return { distance: distance, elevGain: elevGain, elevLoss: elevLoss,
+             duration: duration, avgSpeed: avgSpeed, maxSpeed: maxSpeed,
+             numDescents: numDescents };
 }
 
 // ---------------------------------------------------------------------------
