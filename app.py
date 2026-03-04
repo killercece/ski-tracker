@@ -68,7 +68,8 @@ def init_db():
     """Crée les tables manquantes au démarrage de l'application."""
     db_path = app.config['DATABASE_PATH']
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,11 +184,11 @@ def init_db():
         _resegment_all_sessions(conn)
         conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.11b')")
         logger.info("Migration v1.4.11b : re-segmentation terminée")
-    if '1.4.11c' not in applied:
-        # Re-segmenter avec plafond vitesse 90 km/h + filtre médian
+    if '1.4.11d' not in applied:
+        # Re-segmenter avec plafond 90 km/h forcé dans _build_segment
         _resegment_all_sessions(conn)
-        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.11c')")
-        logger.info("Migration v1.4.11c : vitesses recalculées avec plafond + filtre")
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.11d')")
+        logger.info("Migration v1.4.11d : vitesses plafonnées à 90 km/h")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
@@ -509,9 +510,10 @@ def _build_segment(seg_points, seg_type, seg_speeds):
         t2 = datetime.fromisoformat(seg_points[-1]['time'])
         duration = int((t2 - t1).total_seconds())
 
-    valid_speeds = [s for s in seg_speeds if s > 0]
+    capped_speeds = [min(s, 90.0) for s in seg_speeds]
+    valid_speeds = [s for s in capped_speeds if s > 0]
     avg_speed = sum(valid_speeds) / len(valid_speeds) if valid_speeds else 0.0
-    max_speed = max(seg_speeds) if seg_speeds else 0.0
+    max_speed = max(capped_speeds) if capped_speeds else 0.0
 
     return {
         'type': seg_type,
