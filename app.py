@@ -4,7 +4,7 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.4.8'
+__version__ = '1.4.9'
 
 import os
 import logging
@@ -122,6 +122,16 @@ def init_db():
             bbox_min_lat REAL, bbox_max_lat REAL,
             bbox_min_lon REAL, bbox_max_lon REAL
         );
+
+        CREATE TABLE IF NOT EXISTS reference_lifts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            type TEXT,
+            type_label TEXT,
+            geometry TEXT,
+            bbox_min_lat REAL, bbox_max_lat REAL,
+            bbox_min_lon REAL, bbox_max_lon REAL
+        );
     """)
     # Migration : ajouter user_id si manquant
     cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
@@ -164,6 +174,11 @@ def init_db():
         conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
         conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.7')")
         logger.info("Migration v1.4.7 : référence pistes mise à jour depuis données officielles")
+    if '1.4.9' not in applied:
+        # Purger les matchs pour re-matcher avec les remontées
+        conn.execute("UPDATE tracks SET piste_name=NULL, piste_difficulty=NULL, piste_osm_id=NULL, match_confidence=NULL WHERE segment_type='lift'")
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.9')")
+        logger.info("Migration v1.4.9 : matchs remontées purgés pour re-matching")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
@@ -585,11 +600,14 @@ MATCH_MIN_SCORE = 0.50  # 50% des points doivent matcher
 
 
 def ensure_pistes_cached(session_id=None):
-    """Vérifie que les pistes de référence sont chargées en BDD."""
+    """Vérifie que les pistes et remontées de référence sont chargées en BDD."""
     db = get_db()
     count = db.execute("SELECT COUNT(*) as cnt FROM reference_pistes").fetchone()['cnt']
     if count == 0:
         build_reference_pistes()
+    lift_count = db.execute("SELECT COUNT(*) as cnt FROM reference_lifts").fetchone()['cnt']
+    if lift_count == 0:
+        build_reference_lifts()
 
 
 def point_to_segment_distance(lat, lon, lat1, lon1, lat2, lon2):
@@ -741,11 +759,110 @@ def build_reference_pistes():
                 inserted, len(piste_names))
 
 
+def build_reference_lifts():
+    """Charge les remontées mécaniques depuis le fichier JSON."""
+    ref_path = os.path.join(app.static_folder, 'lifts_3v_reference.json')
+    if not os.path.exists(ref_path):
+        logger.warning("Fichier de référence remontées introuvable : %s", ref_path)
+        return
+    try:
+        with open(ref_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.warning("Impossible de charger le fichier de référence remontées : %s", e)
+        return
+
+    db = get_db()
+    db.execute("DELETE FROM reference_lifts")
+
+    inserted = 0
+    for lift in data.get('lifts', []):
+        geom = lift.get('geometry', [])
+        if len(geom) < 2:
+            continue
+        lats = [pt[0] for pt in geom]
+        lons = [pt[1] for pt in geom]
+        db.execute("""INSERT INTO reference_lifts
+            (name, type, type_label, geometry,
+             bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (lift['name'], lift.get('type', ''), lift.get('type_label', ''),
+             json.dumps(geom), min(lats), max(lats), min(lons), max(lons)))
+        inserted += 1
+
+    db.commit()
+    logger.info("Reference remontées chargées : %d remontées", inserted)
+
+
+def match_track_to_lift(track_id):
+    """Matche un track de remontée à la remontée mécanique la plus proche."""
+    db = get_db()
+
+    points = db.execute("""
+        SELECT latitude, longitude FROM track_points
+        WHERE track_id = ? ORDER BY point_order
+    """, (track_id,)).fetchall()
+
+    if len(points) < 3:
+        return
+
+    sampled = points[::3]
+    if not sampled:
+        return
+
+    lats = [p['latitude'] for p in points]
+    lons = [p['longitude'] for p in points]
+    margin = 0.005
+    track_min_lat = min(lats) - margin
+    track_max_lat = max(lats) + margin
+    track_min_lon = min(lons) - margin
+    track_max_lon = max(lons) + margin
+
+    lifts = db.execute("""
+        SELECT id, name, type_label, geometry
+        FROM reference_lifts
+        WHERE bbox_max_lat >= ? AND bbox_min_lat <= ?
+        AND bbox_max_lon >= ? AND bbox_min_lon <= ?
+    """, (track_min_lat, track_max_lat, track_min_lon, track_max_lon)).fetchall()
+
+    if not lifts:
+        return
+
+    scored = []
+    for lift in lifts:
+        polyline = json.loads(lift['geometry'])
+        if len(polyline) < 2:
+            continue
+
+        close_count = 0
+        for pt in sampled:
+            dist = point_to_polyline_distance(pt['latitude'], pt['longitude'], polyline)
+            if dist <= MATCH_DISTANCE_THRESHOLD:
+                close_count += 1
+
+        score = close_count / len(sampled)
+        if score >= MATCH_MIN_SCORE:
+            scored.append((lift, score))
+
+    if not scored:
+        return
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best_lift, best_score = scored[0]
+
+    # Stocker le nom de la remontée dans piste_name (réutilisation du champ)
+    db.execute("""
+        UPDATE tracks SET piste_name = ?, match_confidence = ?
+        WHERE id = ?
+    """, (best_lift['name'], round(best_score, 2), track_id))
+
+
 def match_session_pistes(session_id):
-    """Matche toutes les descentes d'une session aux pistes OSM."""
+    """Matche toutes les descentes et remontées d'une session."""
     ensure_pistes_cached(session_id)
 
     db = get_db()
+    # Matcher les descentes
     descents = db.execute("""
         SELECT id FROM tracks
         WHERE session_id = ? AND segment_type = 'descent'
@@ -754,9 +871,19 @@ def match_session_pistes(session_id):
     for descent in descents:
         match_track_to_piste(descent['id'])
 
+    # Matcher les remontées
+    lifts = db.execute("""
+        SELECT id FROM tracks
+        WHERE session_id = ? AND segment_type = 'lift'
+    """, (session_id,)).fetchall()
+
+    for lift in lifts:
+        match_track_to_lift(lift['id'])
+
     db.commit()
 
-    logger.info("Matching pistes terminé pour session %d : %d descentes", session_id, len(descents))
+    logger.info("Matching terminé pour session %d : %d descentes, %d remontées",
+                session_id, len(descents), len(lifts))
 
 
 # ---------------------------------------------------------------------------

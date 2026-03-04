@@ -367,7 +367,8 @@ function renderDayMap(tracks, sessionId) {
         // Popup
         var popupContent = '<div style="font-family: Inter, sans-serif; font-size: 13px; line-height: 1.5;">';
         if (isLift) {
-            popupContent += '<strong>Remontee #' + stepNumber + '</strong>' +
+            var liftName = track.piste_name ? track.piste_name : 'Remontee';
+            popupContent += '<strong>' + liftName + ' #' + stepNumber + '</strong>' +
                 '<br>Duree : ' + formatDuration(track.duration_seconds) +
                 '<br>Denivele : ' + fmt0(Math.abs(track.elevation_change)) + ' m';
         } else {
@@ -473,6 +474,7 @@ function renderDayDescentsTable(tracks) {
             timeline.push({
                 type: 'lift',
                 num: stepNum,
+                piste_name: t.piste_name || null,
                 start_time: t.start_time,
                 end_time: t.end_time,
                 distance: t.distance || 0,
@@ -507,7 +509,11 @@ function renderDayDescentsTable(tracks) {
 
         var nameCell = '';
         if (isLift) {
-            nameCell = '<span class="text-zinc-400 dark:text-zinc-500 text-xs">Remontee</span>';
+            if (item.piste_name) {
+                nameCell = '<span class="text-zinc-500 dark:text-zinc-400 text-xs">' + item.piste_name + '</span>';
+            } else {
+                nameCell = '<span class="text-zinc-400 dark:text-zinc-500 text-xs">Remontee</span>';
+            }
         } else {
             var badgeClass = pisteBadgeClass(item.piste_difficulty);
             nameCell = '<span class="piste-badge ' + badgeClass + '"><span class="dot"></span>' + item.piste_name + '</span>';
