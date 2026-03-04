@@ -184,11 +184,11 @@ def init_db():
         _resegment_all_sessions(conn)
         conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.11b')")
         logger.info("Migration v1.4.11b : re-segmentation terminée")
-    if '1.4.11d' not in applied:
-        # Re-segmenter avec plafond 90 km/h forcé dans _build_segment
+    if '1.4.11e' not in applied:
+        # Re-segmenter : stats ne comptent que descentes + lifts (pas les pauses)
         _resegment_all_sessions(conn)
-        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.11d')")
-        logger.info("Migration v1.4.11d : vitesses plafonnées à 90 km/h")
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.11e')")
+        logger.info("Migration v1.4.11e : stats recalculées sans pauses")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
@@ -593,6 +593,10 @@ def compute_session_stats(segments):
     total_moving_time = 0
 
     for seg in segments:
+        # Ne compter que les descentes et remontées (pas les pauses)
+        if seg['type'] == 'pause':
+            continue
+
         stats['total_distance'] += seg['distance']
         stats['duration_seconds'] += seg['duration_seconds']
 
@@ -607,7 +611,7 @@ def compute_session_stats(segments):
         if seg['type'] == 'descent':
             stats['num_descents'] += 1
 
-        if seg['type'] != 'pause' and seg['duration_seconds'] > 0:
+        if seg['duration_seconds'] > 0:
             total_speed_weighted += seg['avg_speed'] * seg['duration_seconds']
             total_moving_time += seg['duration_seconds']
 
