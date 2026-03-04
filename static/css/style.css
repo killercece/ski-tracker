@@ -97,15 +97,14 @@
 
 /* Table row hover */
 #day-descents-table tr {
-    cursor: pointer;
     transition: background-color 0.15s;
 }
 
-#day-descents-table tr:hover {
+#day-descents-table .descent-row:hover {
     background-color: rgba(2, 132, 199, 0.05);
 }
 
-.dark #day-descents-table tr:hover {
+.dark #day-descents-table .descent-row:hover {
     background-color: rgba(2, 132, 199, 0.1);
 }
 
@@ -158,11 +157,6 @@
 .piste-badge.orange .dot { background: #f97316; }
 .dark .piste-badge.orange { background: rgba(249,115,22,0.15); color: #fdba74; }
 
-/* Descente non matchee */
-.unmatched-row {
-    opacity: 0.5;
-}
-
 /* Smooth page transitions */
 main {
     animation: fade-in 0.2s ease-out;
@@ -171,4 +165,43 @@ main {
 @keyframes fade-in {
     from { opacity: 0; }
     to   { opacity: 1; }
+}
+
+/* Timeline : lignes remontee */
+.lift-row {
+    opacity: 0.55;
+}
+
+.lift-row:hover {
+    opacity: 0.8;
+}
+
+/* Timeline : lignes descente */
+.descent-row {
+    cursor: pointer;
+}
+
+.descent-row:hover {
+    background-color: rgba(2, 132, 199, 0.05);
+}
+
+.dark .descent-row:hover {
+    background-color: rgba(2, 132, 199, 0.1);
+}
+
+/* Panel detail piste */
+#piste-detail-panel {
+    transition: all 0.2s ease-out;
+}
+
+/* Numeros sur la carte - Leaflet override */
+.leaflet-marker-icon {
+    background: none !important;
+    border: none !important;
+}
+
+/* Canvas profil */
+#piste-profile-canvas {
+    display: block;
+    max-width: 100%;
 }
