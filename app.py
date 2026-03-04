@@ -180,10 +180,14 @@ def init_db():
         conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.9')")
         logger.info("Migration v1.4.9 : matchs remontées purgés pour re-matching")
     if '1.4.11b' not in applied:
-        # Re-segmenter toutes les sessions (meilleure détection des remontées)
         _resegment_all_sessions(conn)
         conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.11b')")
         logger.info("Migration v1.4.11b : re-segmentation terminée")
+    if '1.4.11c' not in applied:
+        # Re-segmenter avec plafond vitesse 90 km/h + filtre médian
+        _resegment_all_sessions(conn)
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.11c')")
+        logger.info("Migration v1.4.11c : vitesses recalculées avec plafond + filtre")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
@@ -378,6 +382,8 @@ def smooth_values(values, window=5):
 
 def compute_point_metrics(points):
     """Calcule vitesse (km/h) et variation d'altitude entre chaque paire de points."""
+    MAX_SPEED = 90.0  # km/h — plafond réaliste pour GPS de montre/téléphone
+
     speeds = [0.0]
     elevation_deltas = [0.0]
 
@@ -393,13 +399,21 @@ def compute_point_metrics(points):
             dt = (t2 - t1).total_seconds()
 
         speed = (dist / dt * 3.6) if dt > 0 else 0.0
-        # Filtrer le bruit GPS : vitesse max réaliste pour le ski = 150 km/h
-        if speed > 150.0:
-            speed = 0.0
+        if speed > MAX_SPEED:
+            speed = MAX_SPEED
         elev_delta = (curr['elevation'] or 0) - (prev['elevation'] or 0)
 
         speeds.append(speed)
         elevation_deltas.append(elev_delta)
+
+    # Filtre médian sur 3 points pour éliminer les pics GPS isolés
+    if len(speeds) >= 3:
+        filtered = [speeds[0]]
+        for i in range(1, len(speeds) - 1):
+            trio = sorted([speeds[i - 1], speeds[i], speeds[i + 1]])
+            filtered.append(trio[1])
+        filtered.append(speeds[-1])
+        speeds = filtered
 
     return speeds, elevation_deltas
 

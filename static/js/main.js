@@ -601,6 +601,7 @@ function zoomToDayTrack(trackId) { zoomToTracks([trackId]); }
 
 function computePointSpeeds(points) {
     if (!points || points.length < 2) return points;
+    var MAX_SPEED = 90; // km/h — plafond réaliste pour GPS de montre/téléphone
     var result = [];
     for (var i = 0; i < points.length; i++) {
         var p = Object.assign({}, points[i]);
@@ -614,10 +615,22 @@ function computePointSpeeds(points) {
             var dist = Math.sqrt(dlat * dlat + dlon * dlon + dz * dz);
             var t0 = p0.time ? new Date(p0.time).getTime() : 0;
             var t1 = p.time ? new Date(p.time).getTime() : 0;
-            var dt = (t1 - t0) / 1000; // secondes
-            p.speed = dt > 0 ? (dist / dt) * 3.6 : 0; // km/h
+            var dt = (t1 - t0) / 1000;
+            p.speed = dt > 0 ? Math.min((dist / dt) * 3.6, MAX_SPEED) : 0;
         }
         result.push(p);
+    }
+    // Filtre médian sur 3 points (élimine les pics GPS isolés)
+    if (result.length >= 3) {
+        var median = [Object.assign({}, result[0])];
+        for (var i = 1; i < result.length - 1; i++) {
+            var m = Object.assign({}, result[i]);
+            var trio = [result[i - 1].speed, result[i].speed, result[i + 1].speed].sort(function(a, b) { return a - b; });
+            m.speed = trio[1];
+            median.push(m);
+        }
+        median.push(Object.assign({}, result[result.length - 1]));
+        result = median;
     }
     // Lissage (moyenne mobile sur 3 points)
     var smoothed = [];
