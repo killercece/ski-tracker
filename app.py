@@ -4,7 +4,7 @@ Upload de fichiers GPX, détection automatique des descentes/remontées,
 statistiques et visualisation sur carte.
 """
 
-__version__ = '1.4.6'
+__version__ = '1.4.7'
 
 import os
 import logging
@@ -159,6 +159,11 @@ def init_db():
         conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
         conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.6')")
         logger.info("Migration v1.4.6 : tables OSM supprimées, référence rechargée depuis JSON")
+    if '1.4.7' not in applied:
+        conn.execute("DELETE FROM reference_pistes")
+        conn.execute("UPDATE tracks SET piste_osm_id=NULL, piste_name=NULL, piste_difficulty=NULL, match_confidence=NULL")
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES ('1.4.7')")
+        logger.info("Migration v1.4.7 : référence pistes mise à jour depuis données officielles")
     conn.commit()
     conn.close()
     logger.info("Base de données vérifiée")
